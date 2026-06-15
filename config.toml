@@ -1,0 +1,184 @@
+# opensourcellmrouter configuration
+#
+# Exposes both an OpenAI-compatible endpoint (/v1/chat/completions) and an
+# Anthropic-compatible endpoint (/v1/messages). Every request, regardless of
+# which endpoint it came in on, goes through the same pipeline:
+#
+#   prompt -> classifiers -> routers -> provider -> logging
+#
+# - `classifiers` tag the request (e.g. "vision", "nsfw") based on its
+#   content. See src/classifiers/ and docs/classifiers.md.
+# - `routers` is an ordered chain of rules; the first rule that matches
+#   picks the provider (and optionally rewrites the model name). See
+#   src/router.rs and docs/routers.md.
+# - `plugins` are request/response middleware (logging is separate, below).
+#   See src/plugins/ and docs/plugins.md.
+
+[server]
+host = "0.0.0.0"
+port = 8090
+
+# When enabled, every request/response pair is appended to `path` as a line
+# of JSON (model, provider, tags, plugins, messages, response, latency,
+# errors).
+[logging]
+enabled = true
+path = "logs/requests.jsonl"
+
+# Each provider is an upstream that speaks either the OpenAI or Anthropic
+# chat completion format. `cost_per_1m_tokens`, `quality`, `latency_ms`, and
+# `throughput_tokens_per_sec` are only used by the `price`/`latency`/
+# `throughput`/`fallback` router rules below; they're otherwise informational.
+[[providers]]
+name = "local-llama"
+format = "openai"
+base_url = "http://localhost:8080/v1"
+cost_per_1m_tokens = 0.0
+quality = 40
+latency_ms = 800
+throughput_tokens_per_sec = 25
+
+[[providers]]
+name = "openai"
+format = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+cost_per_1m_tokens = 5.0
+quality = 80
+latency_ms = 600
+throughput_tokens_per_sec = 60
+
+[[providers]]
+name = "anthropic"
+format = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+cost_per_1m_tokens = 15.0
+quality = 90
+latency_ms = 700
+throughput_tokens_per_sec = 50
+
+# A local Ollama server. `format = "ollama"` speaks Ollama's native API
+# (/api/chat, /api/tags) rather than the OpenAI-compatible one — `base_url`
+# is Ollama's root, with no `/v1` suffix. At startup, the router queries
+# `/api/tags` to find out which models are actually pulled (see the
+# "discover" router rule below).
+[[providers]]
+name = "ollama"
+format = "ollama"
+base_url = "http://localhost:11434"
+cost_per_1m_tokens = 0.0
+quality = 40
+latency_ms = 800
+throughput_tokens_per_sec = 25
+
+# --- Classifiers --------------------------------------------------------
+#
+# Run on every request, in order, before routing. Each enabled classifier
+# adds zero or more tags to the request, which `routers` rules of type
+# "tag" (below) can match on.
+
+# `keyword`: tags a request if any configured keyword for a tag appears
+# (case-insensitively) in the system prompt or any message. A simple,
+# configurable baseline for capability/policy hints (e.g. "this mentions an
+# image, so route to a vision-capable model").
+[classifiers.keyword]
+enabled = true
+
+[classifiers.keyword.tags]
+vision = ["image", "photo", "picture", "screenshot"]
+video = ["video", "clip", "footage"]
+nsfw = []
+
+# --- Routers --------------------------------------------------------------
+#
+# Checked in order; the first rule that matches wins and decides the
+# provider (and optional model rewrite). A rule that doesn't match passes
+# through to the next one.
+
+# Requests asking for a "local/..." model always go to the local llama-server.
+# It ignores the "model" field, so rewrite it to a placeholder name.
+[[routers]]
+type = "prefix"
+model_prefix = "local/"
+provider = "local-llama"
+rewrite_model = "local-model"
+
+# If `model` is one of the models Ollama actually has pulled (discovered at
+# startup via GET /api/tags), send the request there as-is, e.g. "llama3:8b"
+# or "mistral:latest".
+[[routers]]
+type = "discover"
+provider = "ollama"
+
+# Requests tagged "vision" or "video" by the `keyword` classifier go to a
+# multimodal-capable OpenAI model, regardless of the model the client asked
+# for. (Swap `provider`/`rewrite_model` here for a dedicated image/video
+# model once you have one configured.)
+[[routers]]
+type = "tag"
+tag = "vision"
+provider = "openai"
+rewrite_model = "gpt-4o"
+
+[[routers]]
+type = "tag"
+tag = "video"
+provider = "openai"
+rewrite_model = "gpt-4o"
+
+# Requests tagged "nsfw" are kept on the local model rather than sent to a
+# cloud provider.
+[[routers]]
+type = "tag"
+tag = "nsfw"
+provider = "local-llama"
+rewrite_model = "local-model"
+
+# "gpt-*" and "claude-*" model names go to the matching cloud provider.
+[[routers]]
+type = "prefix"
+model_prefix = "gpt-"
+provider = "openai"
+
+[[routers]]
+type = "prefix"
+model_prefix = "claude-"
+provider = "anthropic"
+
+# Anything else falls through to here: rank every provider by
+#   score = quality_bias * quality - (1 - quality_bias) * cost_per_1m_tokens
+# and pick the highest. 0.0 => always cheapest; 1.0 => always highest quality.
+[[routers]]
+type = "fallback"
+quality_bias = 0.5
+
+# --- Plugins ----------------------------------------------------------------
+#
+# Request/response middleware. Enabled here to run by default for every
+# request; clients can also opt in per-request via a `plugins` array, or
+# override settings (e.g. `tier` for pareto-router).
+
+# Best-effort repair of malformed JSON in a model's reply (markdown fences,
+# trailing commas, truncated/unbalanced brackets).
+[plugins.response-healing]
+enabled = true
+
+# Lets a request pick a "coding quality tier" instead of a specific
+# provider/model. Forces routing to the first provider in the chosen tier,
+# bypassing `routers` entirely.
+[plugins.pareto-router]
+enabled = false
+default_tier = "medium"
+
+[plugins.pareto-router.tiers]
+low = ["local-llama"]
+medium = ["openai"]
+high = ["anthropic"]
+
+# Not yet implemented (enabling these fails the request with a clear error):
+# [plugins.web]
+# enabled = false
+#
+# [plugins.pdf]
+# enabled = false

@@ -1,0 +1,62 @@
+mod canonical;
+mod classifiers;
+mod config;
+mod formats;
+mod logging;
+mod plugins;
+mod provider;
+mod router;
+mod server;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Context;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config.toml".to_string());
+    let config = config::Config::load(&PathBuf::from(&config_path))
+        .with_context(|| format!("loading config from {config_path}"))?;
+
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let client = reqwest::Client::new();
+
+    let mut model_router = router::ModelRouter::from_config(&config)?;
+    model_router.discover_models(&client).await;
+    let model_router = Arc::new(model_router);
+
+    let logger = if config.logging.enabled {
+        Some(Arc::new(
+            logging::RequestLogger::new(&config.logging.path)
+                .with_context(|| format!("opening log file {}", config.logging.path))?,
+        ))
+    } else {
+        None
+    };
+
+    let plugin_registry = Arc::new(plugins::PluginRegistry::from_config(&config));
+    let classifier_registry = Arc::new(classifiers::ClassifierRegistry::from_config(&config));
+
+    let app = server::build_app(server::AppState {
+        router: model_router,
+        client,
+        logger,
+        plugins: plugin_registry,
+        classifiers: classifier_registry,
+    });
+
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("binding to {addr}"))?;
+    tracing::info!("opensourcellmrouter listening on {addr}");
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
