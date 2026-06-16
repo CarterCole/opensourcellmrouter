@@ -2,6 +2,9 @@
 name = "opensourcellmrouter"
 version = "0.2.1"
 edition = "2024"
+description = "An async LLM proxy that routes requests across multiple providers via a configurable pipeline"
+license = "MIT"
+repository = "https://github.com/CarterCole/opensourcellmrouter"
 
 [dependencies]
 anyhow = "1.0.102"
