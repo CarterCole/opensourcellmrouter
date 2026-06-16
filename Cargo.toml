@@ -1,6 +1,6 @@
 [package]
 name = "opensourcellmrouter"
-version = "0.1.0"
+version = "0.2.4"
 edition = "2024"
 description = "A fast, local-first LLM router — proxy any OpenAI/Anthropic/Ollama client to your own provider pipeline with classifiers, cost/latency/random routing rules, plugins, a live dashboard, and a TUI."
 license = "MIT"
