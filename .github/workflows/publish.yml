@@ -22,7 +22,8 @@ jobs:
         run: |
           OIDC_TOKEN=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=crates.io" | jq -r '.value')
-          CARGO_TOKEN=$(curl -sSf -X POST https://crates.io/api/v1/trusted_publishing/tokens \
+          CARGO_REGISTRY_TOKEN=$(curl -sSf -X POST https://crates.io/api/v1/trusted_publishing/tokens \
             -H "Content-Type: application/json" \
             -d "{\"jwt\": \"$OIDC_TOKEN\"}" | jq -r '.token')
-          cargo publish --token "$CARGO_TOKEN"
+          export CARGO_REGISTRY_TOKEN
+          cargo publish
