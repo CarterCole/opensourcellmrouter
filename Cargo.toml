@@ -2,6 +2,15 @@
 name = "opensourcellmrouter"
 version = "0.1.0"
 edition = "2024"
+description = "A fast, local-first LLM router — proxy any OpenAI/Anthropic/Ollama client to your own provider pipeline with classifiers, cost/latency/random routing rules, plugins, a live dashboard, and a TUI."
+license = "MIT"
+repository = "https://github.com/CarterCole/opensourcellmrouter"
+homepage = "https://github.com/CarterCole/opensourcellmrouter"
+documentation = "https://github.com/CarterCole/opensourcellmrouter/tree/master/docs"
+readme = "README.md"
+keywords = ["llm", "ai", "proxy", "router", "ollama"]
+categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
+exclude = [".env", "logs/"]
 
 [dependencies]
 anyhow = "1.0.102"

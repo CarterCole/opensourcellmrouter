@@ -6,7 +6,9 @@ endpoint, is converted to a canonical `ChatRequest` and run through the same
 pipeline:
 
 ```text
-Start -> classifiers -> PreRouting -> routers -> provider -> PostResponse -> End -> logging
+Start → classifiers → PreRouting → routers → provider → PostResponse → End → logging
+         ↓                          ↓
+    [classified]               [routed]        ← SSE events emitted mid-flight
 ```
 
 1. **[Plugins](plugins.md)** `on_start` hooks run first, on the request as
@@ -39,8 +41,20 @@ classifiers.
 ## Live dashboard
 
 `GET /dashboard` serves a small page that streams every request as it's
-handled — provider, model rewrite, tags, plugins, the prompt, and the
-response — via Server-Sent Events from `/dashboard/events`. It's the same
-data written to the request log (`logging.rs`), just pushed live instead of
-(or in addition to) being appended to a file. Disable it with `dashboard =
-false` under `[server]` in `config.toml`.
+handled via Server-Sent Events from `/dashboard/events`. Four event types are
+emitted per request:
+
+| Event | When | Payload |
+|---|---|---|
+| `start` | Request enters the pipeline | id, model as sent by client, in-flight count |
+| `classified` | Classifiers have run | id, tags (e.g. `["code", "vision"]`) |
+| `routed` | Router has picked a provider | id, provider name, model name after rewrite |
+| `complete` | Response (or error) is ready | Full log entry: provider, models, duration, tags, messages, response |
+
+The dashboard card for an in-flight request updates live as `classified` and
+`routed` arrive, so you see the routing decision before the response comes
+back. The same events are printed incrementally by `opensourcellmrouter watch`
+and reflected in the TUI's pending-request list.
+
+`complete` events are the only ones written to the request log file. Disable
+the dashboard with `dashboard = false` under `[server]` in `config.toml`.
