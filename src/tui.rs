@@ -36,7 +36,7 @@ use ratatui::{
 use tokio_stream::StreamExt;
 
 use crate::canonical::Role;
-use crate::logging::LogEntry;
+use crate::logging::{LogEntry, RouterEvent};
 
 const MAX_EVENTS: usize = 200;
 
@@ -46,11 +46,11 @@ const MAX_EVENTS: usize = 200;
 struct Stats {
     total: u32,
     errors: u32,
-    total_duration_ms: u128,
+    total_duration_ms: u64,
     by_provider: HashMap<String, u32>,
     by_tag: HashMap<String, u32>,
     /// Timestamp (ms since epoch) of the last *successful* response per provider.
-    last_ok: HashMap<String, u128>,
+    last_ok: HashMap<String, u64>,
 }
 
 impl Stats {
@@ -72,7 +72,7 @@ impl Stats {
         if self.total == 0 {
             0
         } else {
-            (self.total_duration_ms / self.total as u128) as u64
+            self.total_duration_ms / self.total as u64
         }
     }
 }
@@ -84,18 +84,33 @@ enum Focus {
 }
 
 struct AppState {
+    /// Completed requests, newest first.
     events: VecDeque<LogEntry>,
+    /// In-flight requests that have received a `Start` event but no `Complete`
+    /// yet. Shown at the top of the feed while waiting.
+    pending: Vec<PendingEntry>,
     stats: Stats,
     scroll: usize,
     focus: Focus,
     input: String,
     model: String,
-    last_response: Option<String>,
+    /// Running conversation history sent to the server on each request.
+    chat_history: Vec<serde_json::Value>,
+    /// Accumulates streaming response chunks as they arrive.
+    stream_buf: String,
     /// Routing metadata from the most recent completed request (via SSE).
     last_routed: Option<RoutedMeta>,
     sending: bool,
     sse_status: String,
     base_url: String,
+}
+
+struct PendingEntry {
+    id: u64,
+    ts_ms: u64,
+    model: String,
+    tags: Vec<String>,
+    routed: Option<(String, String)>, // (provider, model)
 }
 
 struct RoutedMeta {
@@ -108,12 +123,14 @@ impl AppState {
     fn new(base_url: &str) -> Self {
         AppState {
             events: VecDeque::new(),
+            pending: Vec::new(),
             stats: Stats::default(),
             scroll: 0,
             focus: Focus::Feed,
             input: String::new(),
             model: "llama3.1:8b".to_string(),
-            last_response: None,
+            chat_history: Vec::new(),
+            stream_buf: String::new(),
             last_routed: None,
             sending: false,
             sse_status: "connecting…".to_string(),
@@ -121,7 +138,24 @@ impl AppState {
         }
     }
 
-    fn push_event(&mut self, entry: LogEntry) {
+    fn on_start(&mut self, id: u64, ts_ms: u64, model: String) {
+        self.pending.push(PendingEntry { id, ts_ms, model, tags: vec![], routed: None });
+    }
+
+    fn on_classified(&mut self, id: u64, tags: Vec<String>) {
+        if let Some(e) = self.pending.iter_mut().find(|e| e.id == id) {
+            e.tags = tags;
+        }
+    }
+
+    fn on_routed(&mut self, id: u64, provider: String, model: String) {
+        if let Some(e) = self.pending.iter_mut().find(|e| e.id == id) {
+            e.routed = Some((provider, model));
+        }
+    }
+
+    fn on_complete(&mut self, id: u64, entry: LogEntry) {
+        self.pending.retain(|e| e.id != id);
         self.stats.ingest(&entry);
         self.last_routed = Some(RoutedMeta {
             provider: entry.provider.clone(),
@@ -204,8 +238,20 @@ async fn read_sse(url: String, state: Arc<Mutex<AppState>>) {
             let line = buf[..nl].trim_end_matches('\r').to_owned();
             buf.drain(..=nl);
             if let Some(data) = line.strip_prefix("data: ") {
-                if let Ok(entry) = serde_json::from_str::<LogEntry>(data) {
-                    state.lock().unwrap().push_event(entry);
+                match serde_json::from_str::<RouterEvent>(data) {
+                    Ok(RouterEvent::Start { id, ts_ms, model, .. }) => {
+                        state.lock().unwrap().on_start(id, ts_ms, model);
+                    }
+                    Ok(RouterEvent::Classified { id, tags, .. }) => {
+                        state.lock().unwrap().on_classified(id, tags);
+                    }
+                    Ok(RouterEvent::Routed { id, provider, model, .. }) => {
+                        state.lock().unwrap().on_routed(id, provider, model);
+                    }
+                    Ok(RouterEvent::Complete { id, entry }) => {
+                        state.lock().unwrap().on_complete(id, entry);
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -225,7 +271,6 @@ async fn event_loop(
     loop {
         tick.tick().await;
 
-        // Non-blocking drain of terminal events.
         while event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
                 if handle_key(key, state).await? {
@@ -241,12 +286,10 @@ async fn event_loop(
 
 // ── input handling ────────────────────────────────────────────────────────────
 
-/// Returns `true` if the app should quit.
 async fn handle_key(
     key: event::KeyEvent,
     state: &Arc<Mutex<AppState>>,
 ) -> anyhow::Result<bool> {
-    // Ctrl-C always quits.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
@@ -285,22 +328,22 @@ async fn handle_key(
                 } else if let Some(name) = s.input.strip_prefix(":model ") {
                     s.model = name.trim().to_string();
                     s.input.clear();
+                } else if s.input.trim() == ":clear" {
+                    s.chat_history.clear();
+                    s.input.clear();
                 } else {
                     let msg = std::mem::take(&mut s.input);
+                    // Append user turn to history, then stream the response.
+                    s.chat_history.push(serde_json::json!({"role": "user", "content": msg}));
+                    let history = s.chat_history.clone();
                     let model = s.model.clone();
                     let url = s.base_url.clone();
                     s.sending = true;
-                    drop(s); // release lock before async work
+                    drop(s);
 
                     let state2 = state.clone();
                     tokio::spawn(async move {
-                        let result = send_chat(&url, &model, &msg).await;
-                        let mut st = state2.lock().unwrap();
-                        st.sending = false;
-                        st.last_response = Some(match result {
-                            Ok(text) => text,
-                            Err(e) => format!("error: {e}"),
-                        });
+                        stream_chat(state2, &url, &model, &history).await;
                     });
                     return Ok(false);
                 }
@@ -313,26 +356,93 @@ async fn handle_key(
     Ok(false)
 }
 
-async fn send_chat(base_url: &str, model: &str, message: &str) -> anyhow::Result<String> {
+/// Sends the conversation history to the server with `stream: true`, updates
+/// `AppState.stream_buf` as chunks arrive, and on completion moves the full
+/// response into `chat_history`. All state transitions (including clearing
+/// `sending`) happen inside this function.
+async fn stream_chat(
+    state: Arc<Mutex<AppState>>,
+    base_url: &str,
+    model: &str,
+    history: &[serde_json::Value],
+) {
     let client = reqwest::Client::new();
-    let resp = client
+
+    let result = client
         .post(format!("{}/v1/chat/completions", base_url.trim_end_matches('/')))
         .json(&serde_json::json!({
             "model": model,
-            "messages": [{"role": "user", "content": message}]
+            "messages": history,
+            "stream": true,
         }))
         .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+        .await;
 
-    if let Some(content) = resp["choices"][0]["message"]["content"].as_str() {
-        return Ok(content.to_string());
+    let resp = match result {
+        Ok(r) => r,
+        Err(e) => {
+            let mut st = state.lock().unwrap();
+            st.chat_history.pop(); // undo the user turn
+            st.chat_history.push(serde_json::json!({"role": "assistant", "content": format!("error: {e}")}));
+            st.sending = false;
+            return;
+        }
+    };
+
+    let mut byte_stream = resp.bytes_stream();
+    let mut buf = String::new();
+
+    while let Some(chunk) = byte_stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                let mut st = state.lock().unwrap();
+                let partial = std::mem::take(&mut st.stream_buf);
+                let content = if partial.is_empty() {
+                    format!("error: {e}")
+                } else {
+                    partial
+                };
+                st.chat_history.push(serde_json::json!({"role": "assistant", "content": content}));
+                st.sending = false;
+                return;
+            }
+        };
+
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim_end_matches('\r').to_owned();
+            buf.drain(..=nl);
+
+            let Some(data) = line.strip_prefix("data: ") else { continue };
+
+            if data == "[DONE]" {
+                let mut st = state.lock().unwrap();
+                let content = std::mem::take(&mut st.stream_buf);
+                st.chat_history.push(serde_json::json!({"role": "assistant", "content": content}));
+                st.sending = false;
+                return;
+            }
+
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(text) = v["choices"][0]["delta"]["content"].as_str() {
+                    state.lock().unwrap().stream_buf.push_str(text);
+                }
+            }
+        }
     }
-    if let Some(err) = resp["error"]["message"].as_str() {
-        return Ok(format!("error: {err}"));
+
+    // Stream ended without [DONE] — commit whatever we have.
+    let mut st = state.lock().unwrap();
+    let content = std::mem::take(&mut st.stream_buf);
+    if !content.is_empty() {
+        st.chat_history.push(serde_json::json!({"role": "assistant", "content": content}));
+    } else {
+        st.chat_history.pop();
+        st.chat_history.push(serde_json::json!({"role": "assistant", "content": "(empty response)"}));
     }
-    Ok("(empty response)".to_string())
+    st.sending = false;
 }
 
 // ── rendering ─────────────────────────────────────────────────────────────────
@@ -357,10 +467,17 @@ fn render_feed(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
     let focused = s.focus == Focus::Feed;
     let border_style = focus_border(focused);
 
+    let in_flight = s.pending.len();
+    let flight_suffix = if in_flight > 0 {
+        format!("  {} in flight", in_flight)
+    } else {
+        String::new()
+    };
     let title = format!(
-        " Pipeline  {}  {} events ",
+        " Pipeline  {}  {} events{} ",
         s.sse_status,
-        s.events.len()
+        s.events.len(),
+        flight_suffix,
     );
     let hint = if focused {
         " ↑/↓ scroll  Tab/i → chat  q quit "
@@ -377,21 +494,63 @@ fn render_feed(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let items: Vec<ListItem> = s
+    // Pending (in-flight) requests appear above completed ones, newest first.
+    let pending_items: Vec<ListItem> = s
+        .pending
+        .iter()
+        .rev()
+        .map(|e| pending_to_list_item(e))
+        .collect();
+
+    let done_items: Vec<ListItem> = s
         .events
         .iter()
         .skip(s.scroll)
         .map(entry_to_list_item)
         .collect();
 
-    f.render_widget(List::new(items), inner);
+    let all_items: Vec<ListItem> = pending_items.into_iter().chain(done_items).collect();
+
+    f.render_widget(List::new(all_items), inner);
+}
+
+fn pending_to_list_item(e: &PendingEntry) -> ListItem<'static> {
+    let secs = e.ts_ms / 1000;
+    let time = format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let elapsed_ms = LogEntry::now_ms().saturating_sub(e.ts_ms);
+
+    let mut spans = vec![
+        Span::styled(time, Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
+        Span::styled("⋯", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+    ];
+
+    if let Some((provider, model)) = &e.routed {
+        spans.push(Span::styled(provider.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(model.clone(), Style::default().fg(Color::Blue)));
+    } else {
+        spans.push(Span::styled(e.model.clone(), Style::default().fg(Color::DarkGray)));
+    }
+
+    for tag in &e.tags {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("[{tag}]"), Style::default().fg(Color::Magenta)));
+    }
+
+    spans.push(Span::styled(
+        format!("  {}ms", elapsed_ms),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    ListItem::new(vec![Line::from(spans), Line::from("")])
 }
 
 fn entry_to_list_item(e: &LogEntry) -> ListItem<'static> {
-    let secs = (e.ts_ms / 1000) as u64;
+    let secs = e.ts_ms / 1000;
     let time = format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60);
 
-    // header: time  provider  model [→ rewrite]  [tags]  Nms
     let mut header: Vec<Span<'static>> = vec![
         Span::styled(time, Style::default().fg(Color::DarkGray)),
         Span::raw("  "),
@@ -484,6 +643,16 @@ fn render_stats(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
         ]),
     ];
 
+    if !s.pending.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                s.pending.len().to_string(),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" in flight", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
     if !s.stats.by_provider.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -551,13 +720,11 @@ fn render_chat(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Split: response fills the space above, input is fixed 3 lines at bottom.
     let split = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(inner);
 
-    // Response pane — title shows routing metadata from last SSE event.
     let route_title = if let Some(meta) = &s.last_routed {
         let mut t = format!(" {} / {} ", meta.provider, meta.sent_model);
         for tag in &meta.tags {
@@ -565,20 +732,63 @@ fn render_chat(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
         }
         t
     } else {
-        " response ".to_string()
+        " conversation ".to_string()
     };
 
-    let resp_text = if s.sending {
-        "sending…".to_string()
+    // Build conversation lines from history, newest visible at the bottom.
+    let conv_lines: Vec<Line> = if s.chat_history.is_empty() && !s.sending {
+        vec![Line::from(Span::styled(
+            "(no messages yet — type below and press Enter)",
+            Style::default().fg(Color::DarkGray),
+        ))]
     } else {
-        s.last_response
-            .clone()
-            .unwrap_or_else(|| "(no messages yet — type below and press Enter)".to_string())
+        let mut lines: Vec<Line> = Vec::new();
+        for msg in &s.chat_history {
+            let role = msg["role"].as_str().unwrap_or("");
+            let content = msg["content"].as_str().unwrap_or("");
+            match role {
+                "user" => {
+                    lines.push(Line::from(vec![
+                        Span::styled("you: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(content.to_string(), Style::default().fg(Color::White)),
+                    ]));
+                }
+                "assistant" => {
+                    for line in content.split('\n') {
+                        lines.push(Line::from(vec![
+                            Span::raw("     "),
+                            Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                        ]));
+                    }
+                    lines.push(Line::from(""));
+                }
+                _ => {}
+            }
+        }
+        // Show streaming buffer as an in-progress assistant turn.
+        if s.sending {
+            if s.stream_buf.is_empty() {
+                lines.push(Line::from(Span::styled("     …", Style::default().fg(Color::DarkGray))));
+            } else {
+                for line in s.stream_buf.split('\n') {
+                    lines.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                    ]));
+                }
+            }
+        }
+        lines
     };
+
+    // Scroll so the most recent content is always visible at the bottom.
+    let pane_height = split[0].height.saturating_sub(2) as usize;
+    let scroll_offset = conv_lines.len().saturating_sub(pane_height) as u16;
+
     f.render_widget(
-        Paragraph::new(resp_text)
-            .style(Style::default().fg(if s.sending { Color::DarkGray } else { Color::White }))
+        Paragraph::new(conv_lines)
             .wrap(Wrap { trim: false })
+            .scroll((scroll_offset, 0))
             .block(
                 Block::default()
                     .title(route_title)
@@ -588,7 +798,6 @@ fn render_chat(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
         split[0],
     );
 
-    // Input field — show a block cursor when focused
     let cursor = if focused && !s.sending { "█" } else { "" };
     f.render_widget(
         Paragraph::new(format!("{}{}", s.input, cursor))
@@ -623,12 +832,12 @@ fn trunc(s: &str, max: usize) -> String {
     if chars.next().is_some() { head + "…" } else { head }
 }
 
-fn ago_str(ts_ms: u128) -> String {
+fn ago_str(ts_ms: u64) -> String {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let secs = (now_ms.saturating_sub(ts_ms) / 1000) as u64;
+    let secs = now_ms.saturating_sub(ts_ms) / 1000;
     if secs < 60 {
         format!("{secs}s ago")
     } else if secs < 3600 {

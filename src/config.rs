@@ -116,6 +116,25 @@ pub enum RouterRule {
     /// discovery hasn't run, failed, or didn't report `model`, this rule
     /// passes through.
     Discover { provider: String },
+    /// Always matches: picks a provider at random from `providers` (or all
+    /// configured providers if `providers` is empty). If `rewrite_model` is
+    /// set, it replaces `model` before forwarding.
+    ///
+    /// If `candidates` is non-empty, picks a `{provider, model}` pair at
+    /// random from that list instead, ignoring `providers`/`rewrite_model`.
+    Random {
+        #[serde(default)]
+        providers: Vec<String>,
+        rewrite_model: Option<String>,
+        #[serde(default)]
+        candidates: Vec<RandomCandidate>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RandomCandidate {
+    pub provider: String,
+    pub model: String,
 }
 
 fn default_quality_bias() -> f64 {
@@ -180,6 +199,11 @@ pub struct ProviderConfig {
     pub base_url: String,
     /// Name of an environment variable holding the API key, if required.
     pub api_key_env: Option<String>,
+    /// If true, the provider is skipped at startup when `api_key_env` is unset.
+    /// If false (default), a warning is logged but the provider is kept — the
+    /// first request that hits it will fail instead of startup.
+    #[serde(default)]
+    pub strict: bool,
     /// Blended cost in USD per 1M tokens. Used by `price` and `fallback` routers.
     #[serde(default)]
     pub cost_per_1m_tokens: f64,

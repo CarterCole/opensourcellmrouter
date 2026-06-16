@@ -48,6 +48,9 @@ pub struct OllamaChatResponse {
     pub model: String,
     #[serde(default)]
     pub message: OllamaResponseMessage,
+    /// `false` on streaming chunks, `true` on the final chunk.
+    #[serde(default)]
+    pub done: bool,
     /// Why generation stopped, e.g. `"stop"` or `"length"`. Only present
     /// once `done` is `true`.
     #[serde(default)]
@@ -174,6 +177,7 @@ mod tests {
             message: OllamaResponseMessage {
                 content: "hello".to_string(),
             },
+            done: true,
             done_reason: Some("stop".to_string()),
             prompt_eval_count: 10,
             eval_count: 5,

@@ -1,16 +1,18 @@
 //! `opensourcellmrouter watch [BASE_URL]`
 //!
 //! Connects to the server's `/dashboard/events` SSE feed and pretty-prints
-//! each request as it's handled. Shares the same wire format as the browser
-//! dashboard — both consume the same JSON [`crate::logging::LogEntry`] lines.
+//! each request as it's handled. Shares the same [`RouterEvent`] wire format
+//! as the browser dashboard and the TUI.
+//!
+//! `Start` events print a one-liner showing the model and in-flight count.
+//! `Complete` events print the full routing/response summary.
 
 use anyhow::Context;
 use tokio_stream::StreamExt;
 
 use crate::canonical::Role;
-use crate::logging::LogEntry;
+use crate::logging::{LogEntry, RouterEvent};
 
-// ANSI escape codes — no extra dependency needed.
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -50,8 +52,30 @@ pub async fn run(base_url: &str) -> anyhow::Result<()> {
             buf.drain(..=nl);
 
             if let Some(data) = line.strip_prefix("data: ") {
-                match serde_json::from_str::<LogEntry>(data) {
-                    Ok(entry) => print_entry(&entry),
+                match serde_json::from_str::<RouterEvent>(data) {
+                    Ok(RouterEvent::Start { id: _, ts_ms, model, in_flight }) => {
+                        let secs = ts_ms / 1000;
+                        let time = format!(
+                            "{:02}:{:02}:{:02}",
+                            (secs / 3600) % 24,
+                            (secs / 60) % 60,
+                            secs % 60,
+                        );
+                        println!(
+                            "{DIM}{time}  ⋯  {RESET}{BLUE}{model}{RESET}{DIM}  ({in_flight} in flight){RESET}"
+                        );
+                    }
+                    Ok(RouterEvent::Classified { id: _, ts_ms: _, tags }) if !tags.is_empty() => {
+                        let tag_str = tags.join(", ");
+                        println!("{DIM}  → classified: [{tag_str}]{RESET}");
+                    }
+                    Ok(RouterEvent::Routed { id: _, ts_ms: _, provider, model }) => {
+                        println!("{DIM}  → routed: {RESET}{BLUE}{provider}{RESET}{DIM}/{RESET}{BLUE}{model}{RESET}");
+                    }
+                    Ok(RouterEvent::Complete { id: _, entry }) => {
+                        print_entry(&entry);
+                    }
+                    Ok(_) => {}
                     Err(err) => eprintln!("{DIM}[parse error: {err}]{RESET}"),
                 }
             }
@@ -62,11 +86,9 @@ pub async fn run(base_url: &str) -> anyhow::Result<()> {
 }
 
 fn print_entry(e: &LogEntry) {
-    // UTC time from the UNIX ms timestamp.
-    let secs = (e.ts_ms / 1000) as u64;
+    let secs = e.ts_ms / 1000;
     let time = format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60);
 
-    // ── header line ──────────────────────────────────────────────────────────
     let mut header = format!("{DIM}{time}{RESET}  {BOLD}{CYAN}{}{RESET}", e.provider);
 
     if e.requested_model != e.sent_model {
@@ -90,7 +112,6 @@ fn print_entry(e: &LogEntry) {
 
     println!("{header}");
 
-    // ── prompt ───────────────────────────────────────────────────────────────
     let last_user = e
         .messages
         .iter()
@@ -100,7 +121,6 @@ fn print_entry(e: &LogEntry) {
         .unwrap_or("");
     println!("  {DIM}prompt:{RESET}  {}", truncate(last_user, 120));
 
-    // ── response or error ────────────────────────────────────────────────────
     if let Some(err) = &e.error {
         println!("  {RED}error:{RESET}   {}", truncate(err, 120));
     } else if let Some(resp) = &e.response {
@@ -114,9 +134,7 @@ fn print_entry(e: &LogEntry) {
     println!();
 }
 
-/// Truncates `s` to at most `max` Unicode scalar values, appending `…` if cut.
 fn truncate(s: &str, max: usize) -> String {
-    // Collapse newlines so multi-turn prompts stay on one line.
     let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
     let mut chars = flat.chars();
     let head: String = chars.by_ref().take(max).collect();

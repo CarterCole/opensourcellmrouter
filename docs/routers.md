@@ -133,6 +133,34 @@ provider = "ollama"
 Useful for routing requests straight to whatever models are actually pulled
 on a local Ollama instance, without hardcoding model names in `routers`.
 
+### `random`
+
+Always resolves: picks a provider at random from `providers` (or all configured
+providers if `providers` is empty). Useful for load-balancing across equivalent
+local models or for A/B testing.
+
+```toml
+[[routers]]
+type = "random"
+providers = ["ollama", "local-llama"]   # omit to include every provider
+```
+
+If you want to randomize across specific **(provider, model) pairs** rather than
+just providers, use `candidates`. Each candidate is picked with equal probability:
+
+```toml
+[[routers]]
+type = "random"
+candidates = [
+  { provider = "local-llama", model = "llama3.2-3b"        },
+  { provider = "ollama",      model = "llama3.1:8b"        },
+  { provider = "ollama",      model = "deepseek-r1:latest" },
+  { provider = "ollama",      model = "gemma3:latest"      },
+]
+```
+
+When `candidates` is set, `providers` and `rewrite_model` are ignored.
+
 ## Provider fields used by routers
 
 These fields on `[[providers]]` entries are read by the rules above (and are

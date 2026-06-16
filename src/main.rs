@@ -12,6 +12,7 @@ mod watch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use anyhow::Context;
 
@@ -68,6 +69,8 @@ async fn main() -> anyhow::Result<()> {
             plugins: plugin_registry,
             classifiers: classifier_registry,
             events,
+            in_flight: Arc::new(AtomicU64::new(0)),
+            next_id: Arc::new(AtomicU64::new(0)),
         },
         config.server.dashboard,
     );

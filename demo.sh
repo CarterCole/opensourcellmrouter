@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# demo.sh — builds and starts opensourcellmrouter pointed at the local
-# llama.cpp server (:8080) and Ollama (:11434), then opens the TUI.
+# demo.sh — builds and starts opensourcellmrouter using config.toml, then opens the TUI.
 #
 # llama-server is started automatically if :8080 is not answering.
 # Ollama must already be running (it usually is as a system service).
+# Re-running the script restarts the router with the current config.toml.
 #
 # Usage: ./demo.sh [router-port]
 set -euo pipefail
@@ -15,6 +15,7 @@ LLAMA_BIN=/home/carter/Code/llama.cpp/build/bin/llama-server
 DEFAULT_MODEL=/home/carter/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
 LLAMA_LOG=/tmp/llama-server-demo.log
+CONFIG=config.toml
 
 BOLD=$'\e[1m'
 DIM=$'\e[2m'
@@ -93,119 +94,42 @@ else
     warn "Ollama not reachable on :$OLLAMA_PORT — ollama routing will pass through"
 fi
 
-# ── 4. write config ───────────────────────────────────────────────────────────
+# ── 4. start router ───────────────────────────────────────────────────────────
 
-step "Writing config"
-CONFIG=$(mktemp /tmp/ollmr-demo-XXXXXX.toml)
-
-cat > "$CONFIG" << TOML
-[server]
-host      = "127.0.0.1"
-port      = $ROUTER_PORT
-dashboard = true
-
-[logging]
-enabled = true
-path    = "/tmp/ollmr-demo-requests.jsonl"
-
-# ── providers ─────────────────────────────────────────────────────────────────
-
-[[providers]]
-name                      = "local-llama"
-format                    = "openai"
-base_url                  = "http://127.0.0.1:$LLAMA_PORT/v1"
-cost_per_1m_tokens        = 0.0
-quality                   = 55
-latency_ms                = 900
-throughput_tokens_per_sec = 20
-
-# Ollama native API — base_url has no /v1 suffix.
-# The "discover" router rule below auto-populates which models are available.
-[[providers]]
-name                      = "ollama"
-format                    = "ollama"
-base_url                  = "http://127.0.0.1:$OLLAMA_PORT"
-cost_per_1m_tokens        = 0.0
-quality                   = 75
-latency_ms                = 600
-throughput_tokens_per_sec = 30
-
-# ── classifiers ───────────────────────────────────────────────────────────────
-
-[classifiers.keyword]
-enabled = true
-[classifiers.keyword.tags]
-vision = ["image", "photo", "picture", "screenshot", "visual"]
-code   = ["function", "class", "import", "def ", "fn "]
-nsfw   = []
-
-# ── routers (first match wins) ────────────────────────────────────────────────
-
-# "local/..." always goes to llama.cpp; model name is cosmetic.
-[[routers]]
-type          = "prefix"
-model_prefix  = "local/"
-provider      = "local-llama"
-rewrite_model = "llama3.2-3b"
-
-# Any model Ollama reports having (discovered at startup via GET /api/tags)
-# is routed straight there — e.g. "llama3.1:8b", "deepseek-r1:latest".
-[[routers]]
-type     = "discover"
-provider = "ollama"
-
-# vision/code classifier tags → route to the larger Ollama model
-[[routers]]
-type          = "tag"
-tag           = "vision"
-provider      = "ollama"
-rewrite_model = "llama3.1:8b"
-
-[[routers]]
-type          = "tag"
-tag           = "code"
-provider      = "ollama"
-rewrite_model = "llama3.1:8b"
-
-# Catch-all: score = 0.7*quality - 0.3*cost. With equal cost=0 this
-# picks the highest-quality provider (ollama, quality=75 > local 55).
-[[routers]]
-type         = "fallback"
-quality_bias = 0.7
-
-# ── plugins ───────────────────────────────────────────────────────────────────
-
-[plugins.response-healing]
-enabled = true
-TOML
-
-ok "config: $CONFIG"
-
-# ── 5. start router ───────────────────────────────────────────────────────────
-
-step "Starting opensourcellmrouter on :$ROUTER_PORT"
+step "Starting opensourcellmrouter on :$ROUTER_PORT (config: $CONFIG)"
+[[ -f "$CONFIG" ]] || die "config file not found: $CONFIG"
+if [[ -f .env ]]; then
+    # shellcheck disable=SC1091
+    set -a; source .env; set +a
+    ok "loaded .env"
+fi
+if fuser -k "${ROUTER_PORT}/tcp" 2>/dev/null; then
+    ok "stopped previous router on :$ROUTER_PORT"
+    sleep 0.3
+fi
 ./target/debug/opensourcellmrouter "$CONFIG" &
 ROUTER_PID=$!
 wait_for "router" "http://127.0.0.1:$ROUTER_PORT/health"
 
-# ── 6. print cheat-sheet and open TUI ────────────────────────────────────────
+# ── 5. print cheat-sheet and open TUI ────────────────────────────────────────
 
 echo
 echo "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo "${BOLD} opensourcellmrouter — local pipeline demo${RESET}"
 echo
+echo "  Config      ${DIM}$CONFIG${RESET}"
 echo "  Dashboard   ${CYAN}http://127.0.0.1:$ROUTER_PORT/dashboard${RESET}"
-echo "  Request log ${DIM}/tmp/ollmr-demo-requests.jsonl${RESET}"
+echo "  Request log ${DIM}logs/requests.jsonl${RESET}"
 echo
-echo "  Default model in TUI chat pane is ${BOLD}gpt-4${RESET} (hits fallback → ollama)."
-echo "  Change it mid-session with  ${CYAN}:model llama3.1:8b${RESET}"
+echo "  Active router: ${BOLD}random${RESET} — picks a model at random each request:"
+echo "    ${DIM}local-llama  llama3.2-3b${RESET}"
+echo "    ${DIM}ollama       llama3.1:8b  deepseek-r1:latest  gemma3:latest${RESET}"
+echo "    ${DIM}cloudflare   llama-3.1-8b  llama-3.2-3b  deepseek-r1-distill  gemma-3-12b${RESET}"
+echo "    ${DIM}openai       gpt-4o-mini  gpt-4o${RESET}  ${YELLOW}(needs OPENAI_API_KEY in .env)${RESET}"
+echo "    ${DIM}anthropic    haiku-4.5  sonnet-4.6${RESET}  ${YELLOW}(needs ANTHROPIC_API_KEY in .env)${RESET}"
 echo
-echo "  Chat examples:"
-echo "    ${DIM}hello world${RESET}                  fallback → ollama (best quality)"
-echo "    ${DIM}write a Python function${RESET}      code tag → llama3.1:8b"
-echo "    ${DIM}local/quick: ping${RESET}            prefix rule → llama.cpp"
-echo "    ${DIM}(model: deepseek-r1:latest)${RESET}  discover rule → ollama as-is"
-echo "    ${DIM}(model: llama3.1:8b)${RESET}         discover rule → ollama as-is"
+echo "  Edit ${BOLD}config.toml${RESET} and re-run ${BOLD}./demo.sh${RESET} to apply changes."
+echo "  See ${CYAN}docs/examples.md${RESET} for provider + router recipes."
 echo
 echo "  Keys: ${BOLD}Tab / i${RESET} focus chat  ${BOLD}↑↓${RESET} scroll feed  ${BOLD}q / Ctrl-C${RESET} quit"
 echo "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"

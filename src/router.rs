@@ -7,8 +7,9 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::bail;
+use rand::seq::SliceRandom;
 
-use crate::config::{Config, ProviderConfig, RouterRule};
+use crate::config::{Config, ProviderConfig, RandomCandidate, RouterRule};
 use crate::provider::Provider;
 
 #[derive(Clone, Copy)]
@@ -33,16 +34,22 @@ impl ModelRouter {
         let mut providers = HashMap::new();
         let mut provider_configs = HashMap::new();
         for provider_config in &config.providers {
-            // Skip providers whose API key env var is declared but not set.
+            // Check API key env var if declared.
             if let Some(var) = &provider_config.api_key_env {
-                match std::env::var(var) {
-                    Ok(v) if !v.is_empty() => {}
-                    _ => {
+                let missing = matches!(std::env::var(var), Ok(v) if v.is_empty())
+                    || std::env::var(var).is_err();
+                if missing {
+                    if provider_config.strict {
                         tracing::warn!(
-                            "skipping provider '{}': ${var} is not set",
+                            "skipping provider '{}': ${var} is not set (strict = true)",
                             provider_config.name
                         );
                         continue;
+                    } else {
+                        tracing::warn!(
+                            "provider '{}': ${var} is not set — requests will fail until it is",
+                            provider_config.name
+                        );
                     }
                 }
             }
@@ -153,6 +160,23 @@ impl ModelRouter {
                 |pc| pc.throughput_tokens_per_sec,
                 Higher,
             ),
+            RouterRule::Random {
+                providers,
+                rewrite_model,
+                candidates,
+            } => {
+                if !candidates.is_empty() {
+                    candidates
+                        .choose(&mut rand::thread_rng())
+                        .map(|RandomCandidate { provider, model }| (provider.clone(), model.clone()))
+                } else {
+                    let names: Vec<String> = self.candidate_names(providers).collect();
+                    names.choose(&mut rand::thread_rng()).map(|name| {
+                        let target = rewrite_model.clone().unwrap_or_else(|| model.to_string());
+                        (name.clone(), target)
+                    })
+                }
+            }
             RouterRule::Discover { provider } => {
                 if self
                     .available_models

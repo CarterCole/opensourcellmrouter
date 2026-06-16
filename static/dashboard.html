@@ -92,6 +92,15 @@
   .label { color: var(--muted); margin-right: 0.4em; }
   .error-msg { color: var(--error); }
   .usage { color: var(--muted); font-size: 0.75rem; }
+  .entry.inflight { border-color: #3a4a6b; opacity: 0.7; }
+  .inflight-spinner { color: #9cc0ff; font-size: 1.1em; }
+  .in-flight-badge {
+    font-size: 0.75rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+    border: 1px solid #3a4a6b;
+    color: #9cc0ff;
+  }
 </style>
 </head>
 <body>
@@ -107,6 +116,8 @@ const entriesEl = document.getElementById('entries');
 const statusEl = document.getElementById('status');
 const countEl = document.getElementById('count');
 let count = 0;
+// Map from request id → placeholder element for in-flight requests.
+const inFlight = new Map();
 
 function fmtTime(ms) {
   const d = new Date(ms);
@@ -220,6 +231,37 @@ function renderEntry(entry) {
   return el;
 }
 
+function renderStart(event) {
+  const el = document.createElement('div');
+  el.className = 'entry inflight';
+  const row1 = document.createElement('div');
+  row1.className = 'row1';
+
+  const time = document.createElement('span');
+  time.className = 'time';
+  time.textContent = fmtTime(event.ts_ms);
+  row1.appendChild(time);
+
+  const spinner = document.createElement('span');
+  spinner.className = 'inflight-spinner';
+  spinner.textContent = '⋯';
+  row1.appendChild(spinner);
+
+  const model = document.createElement('span');
+  model.className = 'model';
+  model.textContent = event.model;
+  row1.appendChild(model);
+
+  const badge = document.createElement('span');
+  badge.className = 'in-flight-badge';
+  badge.textContent = event.in_flight + ' in flight';
+  row1.appendChild(badge);
+
+  el.appendChild(row1);
+  inFlight.set(event.id, el);
+  entriesEl.insertBefore(el, entriesEl.firstChild);
+}
+
 function connect() {
   const es = new EventSource('/dashboard/events');
 
@@ -234,17 +276,58 @@ function connect() {
   };
 
   es.onmessage = (ev) => {
-    let entry;
+    let event;
     try {
-      entry = JSON.parse(ev.data);
+      event = JSON.parse(ev.data);
     } catch {
       return;
     }
-    count++;
-    countEl.textContent = count + ' request' + (count === 1 ? '' : 's');
-    entriesEl.insertBefore(renderEntry(entry), entriesEl.firstChild);
-    while (entriesEl.children.length > MAX_ENTRIES) {
-      entriesEl.removeChild(entriesEl.lastChild);
+
+    if (event.type === 'start') {
+      renderStart(event);
+      return;
+    }
+
+    if (event.type === 'classified') {
+      const el = inFlight.get(event.id);
+      if (el && event.tags && event.tags.length) {
+        const row1 = el.querySelector('.row1');
+        for (const tag of event.tags) row1.appendChild(pill(tag, 'tag'));
+      }
+      return;
+    }
+
+    if (event.type === 'routed') {
+      const el = inFlight.get(event.id);
+      if (el) {
+        const providerEl = el.querySelector('.provider') || document.createElement('span');
+        providerEl.className = 'provider';
+        providerEl.textContent = event.provider;
+        const modelEl = el.querySelector('.model');
+        if (modelEl) modelEl.textContent = event.model;
+        const row1 = el.querySelector('.row1');
+        if (!el.querySelector('.provider')) {
+          const spinner = row1.querySelector('.inflight-spinner');
+          spinner.after(providerEl);
+        }
+      }
+      return;
+    }
+
+    if (event.type === 'complete') {
+      // Remove the in-flight placeholder if it exists.
+      const placeholder = inFlight.get(event.id);
+      if (placeholder) {
+        placeholder.remove();
+        inFlight.delete(event.id);
+      }
+      count++;
+      countEl.textContent = count + ' request' + (count === 1 ? '' : 's');
+      // The Complete variant has LogEntry fields flattened at the top level.
+      entriesEl.insertBefore(renderEntry(event), entriesEl.firstChild);
+      while (entriesEl.children.length > MAX_ENTRIES) {
+        entriesEl.removeChild(entriesEl.lastChild);
+      }
     }
   };
 }

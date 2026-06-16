@@ -4,10 +4,12 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -21,12 +23,11 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::canonical::{ChatRequest, ChatResponse};
 use crate::classifiers::ClassifierRegistry;
 use crate::formats::{anthropic, openai};
-use crate::logging::{LogEntry, RequestLogger};
+use crate::logging::{LogEntry, RequestLogger, RouterEvent};
 use crate::plugins::{Flow, Plugin, PluginContext, PluginRegistry, Stage};
 use crate::router::ModelRouter;
 
-/// Embedded dashboard page, served at `/dashboard` when enabled. Connects
-/// to `/dashboard/events` via SSE to show requests as they're handled.
+/// Embedded dashboard page, served at `/dashboard` when enabled.
 const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
 
 #[derive(Clone)]
@@ -36,10 +37,12 @@ pub struct AppState {
     pub logger: Option<Arc<RequestLogger>>,
     pub plugins: Arc<PluginRegistry>,
     pub classifiers: Arc<ClassifierRegistry>,
-    /// Broadcasts a JSON [`LogEntry`] line for every handled request, for
-    /// the `/dashboard/events` SSE feed. Sending is a no-op if there are no
-    /// subscribers.
+    /// Broadcasts serialized [`RouterEvent`] JSON for the SSE feed.
     pub events: broadcast::Sender<Arc<str>>,
+    /// Number of requests currently inside `dispatch`.
+    pub in_flight: Arc<AtomicU64>,
+    /// Monotonically increasing request id, used to correlate Start/Complete.
+    pub next_id: Arc<AtomicU64>,
 }
 
 pub fn build_app(state: AppState, dashboard: bool) -> AxumRouter {
@@ -65,8 +68,7 @@ async fn dashboard_page() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
 
-/// Streams a JSON [`LogEntry`] line as an SSE `data:` event for every
-/// request handled from this point on.
+/// Streams [`RouterEvent`] JSON as SSE `data:` events for every request.
 async fn dashboard_events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -76,16 +78,11 @@ async fn dashboard_events(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
-/// Error type for the request handlers, rendered as a JSON error body.
+/// Error type for the request handlers.
 enum ApiError {
-    /// No route or default provider matches the requested model.
     NoProvider(String),
-    /// The chosen provider returned an error or an unparsable response.
     Upstream(anyhow::Error),
-    /// A plugin's `on_start`/`pre_request` hook failed.
     Plugin(&'static str, anyhow::Error),
-    /// The pipeline finished with no response: a plugin returned
-    /// [`Flow::Stop`] before routing without writing one into `resp`.
     NoResponse,
 }
 
@@ -120,17 +117,19 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Decrements `in_flight` when dropped. Used as a RAII guard in `dispatch`
+/// so the counter stays accurate even when the function returns early via `?`.
+struct InFlightGuard(Arc<AtomicU64>);
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 type ResolvedPlugins = Vec<(Arc<dyn Plugin>, Map<String, Value>)>;
 
-/// Runs every resolved plugin's hook for `stage`, in order, until one
-/// returns [`Flow::Stop`]. Pushes the id of any plugin that returns
-/// [`Flow::Modified`] or [`Flow::Stop`] into `active` — those are the
-/// only ones worth surfacing in logs/UI.
-///
-/// Errors from [`Stage::Start`]/[`Stage::PreRouting`] hooks abort the
-/// request (`ApiError::Plugin`). Errors from [`Stage::PostResponse`]/
-/// [`Stage::End`] hooks are logged and treated as [`Flow::Continue`], since
-/// a response is already available by then.
+/// Runs every resolved plugin's hook for `stage`, pushing the id of any that
+/// returned [`Flow::Modified`] or [`Flow::Stop`] into `active`.
 async fn run_stage(
     plugins: &ResolvedPlugins,
     client: &reqwest::Client,
@@ -175,47 +174,64 @@ async fn run_stage(
     Ok(Flow::Continue)
 }
 
-/// Serializes `entry` once and both appends it to the request log file (if
-/// enabled) and broadcasts it to any `/dashboard/events` subscribers.
-fn record(state: &AppState, entry: &LogEntry) {
-    let line = match serde_json::to_string(entry) {
-        Ok(line) => line,
+/// Serializes `event`, writes `Complete` variants to the log file, and
+/// broadcasts to all `/dashboard/events` subscribers.
+fn broadcast(state: &AppState, event: &RouterEvent) {
+    let line = match serde_json::to_string(event) {
+        Ok(l) => l,
         Err(err) => {
-            tracing::warn!("failed to serialize log entry: {err}");
+            tracing::warn!("failed to serialize event: {err}");
             return;
         }
     };
 
     if let Some(logger) = &state.logger {
-        logger.log_line(&line);
+        if matches!(event, RouterEvent::Complete { .. }) {
+            logger.log_line(&line);
+        }
     }
 
-    // Err just means no dashboard is currently listening.
     let _ = state.events.send(Arc::from(line));
 }
 
 /// Runs the full pipeline for one request:
 ///
 /// ```text
-/// Start -> classifiers -> PreRouting -> routers -> provider -> PostResponse -> End -> logging
+/// Start → classifiers → PreRouting → routers → provider → PostResponse → End → logging
 /// ```
 ///
-/// A plugin can stop the pipeline early at `Start` or `PreRouting` (skipping
-/// routing and the provider call) by writing a response into `resp` and
-/// returning [`Flow::Stop`]; `PostResponse`/`End` always run afterwards.
+/// Emits a [`RouterEvent::Start`] immediately so the UI can show in-flight
+/// requests before a response is ready, then a [`RouterEvent::Complete`] once
+/// the pipeline finishes (successfully or with an error).
 async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<ChatResponse, ApiError> {
+    let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    let in_flight = state.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+    // Decrement in_flight when this function returns, even on early error exit.
+    let _guard = InFlightGuard(state.in_flight.clone());
+
+    let requested_model = req.model.clone();
+    let started = Instant::now();
+
+    broadcast(state, &RouterEvent::Start {
+        id,
+        ts_ms: LogEntry::now_ms(),
+        model: requested_model.clone(),
+        in_flight,
+    });
+
     let resolved_plugins = state.plugins.resolve(&req);
     let mut resp: Option<ChatResponse> = None;
     let mut active_plugins: Vec<String> = Vec::new();
-
-    let requested_model = req.model.clone();
     let mut sent_model = req.model.clone();
     let mut provider_name = "plugin".to_string();
 
-    let started = Instant::now();
-
     if run_stage(&resolved_plugins, &state.client, Stage::Start, &mut req, &mut resp, &mut active_plugins).await? == Flow::Continue {
         req.tags = state.classifiers.classify(&req).await;
+        broadcast(state, &RouterEvent::Classified {
+            id,
+            ts_ms: LogEntry::now_ms(),
+            tags: req.tags.clone(),
+        });
 
         let routing_flow =
             run_stage(&resolved_plugins, &state.client, Stage::PreRouting, &mut req, &mut resp, &mut active_plugins).await?;
@@ -237,19 +253,25 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<ChatResponse
 
             sent_model = target_model.clone();
             provider_name = provider.name.clone();
+            broadcast(state, &RouterEvent::Routed {
+                id,
+                ts_ms: LogEntry::now_ms(),
+                provider: provider_name.clone(),
+                model: target_model.clone(),
+            });
             req.model = target_model;
 
             match provider.send(&state.client, &req).await {
                 Ok(r) => resp = Some(r),
                 Err(err) => {
-                    record(
-                        state,
-                        &LogEntry {
+                    broadcast(state, &RouterEvent::Complete {
+                        id,
+                        entry: LogEntry {
                             ts_ms: LogEntry::now_ms(),
                             provider: provider_name,
                             requested_model,
                             sent_model,
-                            duration_ms: started.elapsed().as_millis(),
+                            duration_ms: started.elapsed().as_millis() as u64,
                             tags: req.tags,
                             plugins: active_plugins,
                             system: req.system,
@@ -257,7 +279,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<ChatResponse
                             response: None,
                             error: Some(err.to_string()),
                         },
-                    );
+                    });
                     return Err(ApiError::Upstream(err));
                 }
             }
@@ -270,14 +292,14 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<ChatResponse
         run_stage(&resolved_plugins, &state.client, Stage::End, &mut req, &mut resp, &mut active_plugins).await?;
     }
 
-    record(
-        state,
-        &LogEntry {
+    broadcast(state, &RouterEvent::Complete {
+        id,
+        entry: LogEntry {
             ts_ms: LogEntry::now_ms(),
             provider: provider_name,
             requested_model,
             sent_model,
-            duration_ms: started.elapsed().as_millis(),
+            duration_ms: started.elapsed().as_millis() as u64,
             tags: req.tags,
             plugins: active_plugins,
             system: req.system,
@@ -285,7 +307,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<ChatResponse
             response: resp.clone(),
             error: None,
         },
-    );
+    });
 
     resp.ok_or(ApiError::NoResponse)
 }
@@ -293,9 +315,111 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<ChatResponse
 async fn chat_completions(
     State(state): State<AppState>,
     Json(body): Json<openai::OpenAiChatRequest>,
-) -> Result<Json<openai::OpenAiChatResponse>, ApiError> {
-    let resp = dispatch(&state, body.into()).await?;
-    Ok(Json(resp.into()))
+) -> Response {
+    let streaming = body.stream;
+    if streaming {
+        dispatch_stream(state, body.into()).await
+    } else {
+        match dispatch(&state, body.into()).await {
+            Ok(resp) => Json(openai::OpenAiChatResponse::from(resp)).into_response(),
+            Err(e) => e.into_response(),
+        }
+    }
+}
+
+/// Streaming variant of dispatch: classifies + routes the request, then
+/// proxies the provider's SSE stream directly to the client. Plugins are
+/// skipped (they operate on complete responses). Emits `RouterEvent::Start`
+/// immediately and `RouterEvent::Complete` when the stream finishes.
+async fn dispatch_stream(state: AppState, mut req: ChatRequest) -> Response {
+    let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    let in_flight = state.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+
+    let requested_model = req.model.clone();
+    let started = Instant::now();
+
+    broadcast(&state, &RouterEvent::Start {
+        id,
+        ts_ms: LogEntry::now_ms(),
+        model: requested_model.clone(),
+        in_flight,
+    });
+
+    // Classify + route without running plugins.
+    req.tags = state.classifiers.classify(&req).await;
+    broadcast(&state, &RouterEvent::Classified {
+        id,
+        ts_ms: LogEntry::now_ms(),
+        tags: req.tags.clone(),
+    });
+
+    let (provider, target_model) = match state.router.resolve(&req.model, &req.tags) {
+        Some(p) => p,
+        None => {
+            state.in_flight.fetch_sub(1, Ordering::Relaxed);
+            return ApiError::NoProvider(req.model.clone()).into_response();
+        }
+    };
+
+    let provider_name = provider.name.clone();
+    let sent_model = target_model.clone();
+    let tags = req.tags.clone();
+    broadcast(&state, &RouterEvent::Routed {
+        id,
+        ts_ms: LogEntry::now_ms(),
+        provider: provider_name.clone(),
+        model: target_model.clone(),
+    });
+    req.model = target_model;
+
+    let chunk_stream = match provider.send_streaming(&state.client, &req).await {
+        Ok(s) => s,
+        Err(e) => {
+            state.in_flight.fetch_sub(1, Ordering::Relaxed);
+            return ApiError::Upstream(e).into_response();
+        }
+    };
+
+    // Proxy the SSE stream in a spawned task; emit Complete when done.
+    let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<bytes::Bytes>>(64);
+    let state_clone = state.clone();
+    let in_flight_arc = state.in_flight.clone();
+
+    tokio::spawn(async move {
+        let _guard = InFlightGuard(in_flight_arc);
+        let mut stream = chunk_stream;
+
+        while let Some(item) = stream.next().await {
+            if tx.send(item).await.is_err() {
+                return; // client disconnected
+            }
+        }
+
+        broadcast(&state_clone, &RouterEvent::Complete {
+            id,
+            entry: LogEntry {
+                ts_ms: LogEntry::now_ms(),
+                provider: provider_name,
+                requested_model,
+                sent_model,
+                duration_ms: started.elapsed().as_millis() as u64,
+                tags,
+                plugins: Vec::new(),
+                system: req.system,
+                messages: req.messages,
+                response: None,
+                error: None,
+            },
+        });
+    });
+
+    let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(body)
+        .unwrap()
 }
 
 async fn messages(
