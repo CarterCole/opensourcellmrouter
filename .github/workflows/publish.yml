@@ -19,11 +19,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Publish
-        run: |
-          OIDC_TOKEN=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=crates.io" | jq -r '.value')
-          CARGO_REGISTRY_TOKEN=$(curl -sSf -X POST https://crates.io/api/v1/trusted_publishing/tokens \
-            -H "Content-Type: application/json" \
-            -d "{\"jwt\": \"$OIDC_TOKEN\"}" | jq -r '.token')
-          export CARGO_REGISTRY_TOKEN
-          cargo publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
