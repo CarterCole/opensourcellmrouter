@@ -35,3 +35,12 @@ details.
 
 See each linked doc for its config schema and how to add new rules/plugins/
 classifiers.
+
+## Live dashboard
+
+`GET /dashboard` serves a small page that streams every request as it's
+handled — provider, model rewrite, tags, plugins, the prompt, and the
+response — via Server-Sent Events from `/dashboard/events`. It's the same
+data written to the request log (`logging.rs`), just pushed live instead of
+(or in addition to) being appended to a file. Disable it with `dashboard =
+false` under `[server]` in `config.toml`.

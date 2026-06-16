@@ -29,6 +29,7 @@ use crate::config::Config;
 
 /// Resources and per-request settings handed to a plugin's hooks.
 pub struct PluginContext {
+    #[allow(dead_code)]
     pub client: reqwest::Client,
     /// This plugin's settings: config defaults merged with (and overridden
     /// by) any matching entry in the request's `plugins` array.
@@ -64,9 +65,11 @@ pub enum Stage {
 /// Returned by a hook to control whether later hooks/stages run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
-    /// Fall through to the next hook, and eventually the next pipeline
-    /// stage.
+    /// Hook ran but made no changes; fall through to the next hook.
     Continue,
+    /// Hook actively mutated `req` or `resp`; fall through to the next hook.
+    /// This is the signal used to record that a plugin did real work.
+    Modified,
     /// Stop running further hooks.
     ///
     /// For [`Stage::Start`] and [`Stage::PreRouting`], this also skips
@@ -75,6 +78,7 @@ pub enum Flow {
     /// response and fails.
     ///
     /// For [`Stage::PostResponse`], this also skips [`Stage::End`].
+    #[allow(dead_code)]
     Stop,
 }
 

@@ -7,11 +7,11 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::canonical::{ChatResponse, Message};
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct LogEntry {
     pub ts_ms: u128,
     pub provider: String,
@@ -24,7 +24,7 @@ pub struct LogEntry {
     /// [`crate::classifiers`]), e.g. `["vision"]`.
     pub tags: Vec<String>,
     /// Ids of plugins that ran for this request (see [`crate::plugins`]).
-    pub plugins: Vec<&'static str>,
+    pub plugins: Vec<String>,
     pub system: Option<String>,
     pub messages: Vec<Message>,
     pub response: Option<ChatResponse>,
@@ -58,15 +58,8 @@ impl RequestLogger {
         })
     }
 
-    pub fn log(&self, entry: &LogEntry) {
-        let line = match serde_json::to_string(entry) {
-            Ok(line) => line,
-            Err(err) => {
-                tracing::warn!("failed to serialize log entry: {err}");
-                return;
-            }
-        };
-
+    /// Appends a pre-serialized JSON line (see [`LogEntry`]) to the log file.
+    pub fn log_line(&self, line: &str) {
         let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(err) = writeln!(file, "{line}") {
             tracing::warn!("failed to write log entry: {err}");

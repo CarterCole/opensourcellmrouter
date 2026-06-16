@@ -67,6 +67,6 @@ impl Plugin for ParetoRouterPlugin {
             .ok_or_else(|| anyhow::anyhow!("pareto-router: tier '{tier}' has no providers configured"))?;
 
         req.forced_provider = Some(provider.to_string());
-        Ok(Flow::Continue)
+        Ok(Flow::Modified)
     }
 }

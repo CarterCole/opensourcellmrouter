@@ -36,6 +36,7 @@ impl Plugin for ResponseHealingPlugin {
 
         if let Some(healed) = heal_json(&resp.content) {
             resp.content = healed;
+            return Ok(Flow::Modified);
         }
 
         Ok(Flow::Continue)

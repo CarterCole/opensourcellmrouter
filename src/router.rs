@@ -30,15 +30,28 @@ pub struct ModelRouter {
 
 impl ModelRouter {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
-        if config.providers.is_empty() {
-            bail!("no providers configured");
-        }
-
         let mut providers = HashMap::new();
         let mut provider_configs = HashMap::new();
         for provider_config in &config.providers {
+            // Skip providers whose API key env var is declared but not set.
+            if let Some(var) = &provider_config.api_key_env {
+                match std::env::var(var) {
+                    Ok(v) if !v.is_empty() => {}
+                    _ => {
+                        tracing::warn!(
+                            "skipping provider '{}': ${var} is not set",
+                            provider_config.name
+                        );
+                        continue;
+                    }
+                }
+            }
             providers.insert(provider_config.name.clone(), Provider::from_config(provider_config));
             provider_configs.insert(provider_config.name.clone(), provider_config.clone());
+        }
+
+        if providers.is_empty() {
+            bail!("no providers available (all require API keys that are not set)");
         }
 
         Ok(ModelRouter {
@@ -151,7 +164,7 @@ impl ModelRouter {
                     None
                 }
             }
-            RouterRule::Fallback { providers, quality_bias } => {
+            RouterRule::Fallback { providers, quality_bias, rewrite_model } => {
                 let mut scored: Vec<(String, f64)> = self
                     .candidate_names(providers)
                     .filter_map(|name| {
@@ -162,7 +175,10 @@ impl ModelRouter {
                     })
                     .collect();
                 scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-                scored.into_iter().next().map(|(name, _)| (name, model.to_string()))
+                scored.into_iter().next().map(|(name, _)| {
+                    let target = rewrite_model.clone().unwrap_or_else(|| model.to_string());
+                    (name, target)
+                })
             }
         }
     }

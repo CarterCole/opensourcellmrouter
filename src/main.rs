@@ -7,6 +7,8 @@ mod plugins;
 mod provider;
 mod router;
 mod server;
+mod tui;
+mod watch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,9 +21,21 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "config.toml".to_string());
+    let mut args = std::env::args().skip(1).peekable();
+    let config_path = match args.peek().map(String::as_str) {
+        Some("watch") => {
+            args.next();
+            let url = args.next().unwrap_or_else(|| "http://localhost:8090".to_string());
+            return watch::run(&url).await;
+        }
+        Some("tui") => {
+            args.next();
+            let url = args.next().unwrap_or_else(|| "http://localhost:8090".to_string());
+            return tui::run(&url).await;
+        }
+        _ => args.next().unwrap_or_else(|| "config.toml".to_string()),
+    };
+
     let config = config::Config::load(&PathBuf::from(&config_path))
         .with_context(|| format!("loading config from {config_path}"))?;
 
@@ -44,13 +58,19 @@ async fn main() -> anyhow::Result<()> {
     let plugin_registry = Arc::new(plugins::PluginRegistry::from_config(&config));
     let classifier_registry = Arc::new(classifiers::ClassifierRegistry::from_config(&config));
 
-    let app = server::build_app(server::AppState {
-        router: model_router,
-        client,
-        logger,
-        plugins: plugin_registry,
-        classifiers: classifier_registry,
-    });
+    let (events, _) = tokio::sync::broadcast::channel(256);
+
+    let app = server::build_app(
+        server::AppState {
+            router: model_router,
+            client,
+            logger,
+            plugins: plugin_registry,
+            classifiers: classifier_registry,
+            events,
+        },
+        config.server.dashboard,
+    );
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

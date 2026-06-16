@@ -105,6 +105,9 @@ pub enum RouterRule {
         providers: Vec<String>,
         #[serde(default = "default_quality_bias")]
         quality_bias: f64,
+        /// If set, replaces the model name before forwarding (useful when the
+        /// fallback provider requires a specific model name).
+        rewrite_model: Option<String>,
     },
     /// Matches if `model` is one of the models `provider` reports having
     /// available, as discovered at startup via
@@ -142,6 +145,9 @@ impl Default for LoggingConfig {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Whether to serve the live request dashboard at `/dashboard` (and its
+    /// `/dashboard/events` SSE feed).
+    pub dashboard: bool,
 }
 
 impl Default for ServerConfig {
@@ -149,6 +155,7 @@ impl Default for ServerConfig {
         ServerConfig {
             host: "0.0.0.0".to_string(),
             port: 8090,
+            dashboard: false,
         }
     }
 }

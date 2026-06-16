@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>opensourcellmrouter — live requests</title>
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: #0f1115;
+    --panel: #181b22;
+    --border: #2a2e38;
+    --text: #e6e6e6;
+    --muted: #9aa0ac;
+    --accent: #4f8cff;
+    --error: #ff5f5f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+    z-index: 1;
+  }
+  header h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+  #status {
+    font-size: 0.8rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  #status.connected { color: #6ee7a0; border-color: #2d4a36; }
+  #status.disconnected { color: var(--error); border-color: #4a2d2d; }
+  #count { color: var(--muted); font-size: 0.8rem; margin-left: auto; }
+  main { padding: 0.75rem 1rem; display: flex; flex-direction: column; gap: 0.5rem; }
+  .entry {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    padding: 0.6rem 0.8rem;
+  }
+  .entry.error { border-color: #4a2d2d; }
+  .row1 {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+  }
+  .time { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .provider {
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .model { color: var(--muted); }
+  .arrow { color: var(--muted); }
+  .duration { color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+  .pill {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .pill.tag { border-color: #3a4a6b; color: #9cc0ff; }
+  .pill.plugin { border-color: #4a3a6b; color: #c39cff; }
+  .body { margin-top: 0.4rem; display: grid; gap: 0.3rem; }
+  .prompt, .response, .error-msg {
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 4.5em;
+    overflow: hidden;
+    cursor: pointer;
+    position: relative;
+  }
+  .prompt.expanded, .response.expanded, .error-msg.expanded {
+    max-height: none;
+  }
+  .label { color: var(--muted); margin-right: 0.4em; }
+  .error-msg { color: var(--error); }
+  .usage { color: var(--muted); font-size: 0.75rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>opensourcellmrouter</h1>
+  <span id="status" class="disconnected">connecting…</span>
+  <span id="count"></span>
+</header>
+<main id="entries"></main>
+<script>
+const MAX_ENTRIES = 200;
+const entriesEl = document.getElementById('entries');
+const statusEl = document.getElementById('status');
+const countEl = document.getElementById('count');
+let count = 0;
+
+function fmtTime(ms) {
+  const d = new Date(ms);
+  return d.toLocaleTimeString();
+}
+
+function lastUserMessage(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') return messages[i].content;
+  }
+  return messages.length ? messages[messages.length - 1].content : '';
+}
+
+function pill(text, cls) {
+  const span = document.createElement('span');
+  span.className = 'pill ' + cls;
+  span.textContent = text;
+  return span;
+}
+
+function toggleExpand(e) {
+  e.currentTarget.classList.toggle('expanded');
+}
+
+function renderEntry(entry) {
+  const el = document.createElement('div');
+  el.className = 'entry' + (entry.error ? ' error' : '');
+
+  const row1 = document.createElement('div');
+  row1.className = 'row1';
+
+  const time = document.createElement('span');
+  time.className = 'time';
+  time.textContent = fmtTime(entry.ts_ms);
+  row1.appendChild(time);
+
+  const provider = document.createElement('span');
+  provider.className = 'provider';
+  provider.textContent = entry.provider;
+  row1.appendChild(provider);
+
+  const model = document.createElement('span');
+  model.className = 'model';
+  if (entry.requested_model !== entry.sent_model) {
+    model.innerHTML = '';
+    model.append(entry.requested_model, ' ');
+    const arrow = document.createElement('span');
+    arrow.className = 'arrow';
+    arrow.textContent = '→';
+    model.appendChild(arrow);
+    model.append(' ' + entry.sent_model);
+  } else {
+    model.textContent = entry.sent_model;
+  }
+  row1.appendChild(model);
+
+  for (const tag of entry.tags || []) row1.appendChild(pill(tag, 'tag'));
+  for (const plugin of entry.plugins || []) row1.appendChild(pill(plugin, 'plugin'));
+
+  const duration = document.createElement('span');
+  duration.className = 'duration';
+  duration.textContent = entry.duration_ms + ' ms';
+  row1.appendChild(duration);
+
+  el.appendChild(row1);
+
+  const body = document.createElement('div');
+  body.className = 'body';
+
+  const prompt = document.createElement('div');
+  prompt.className = 'prompt';
+  prompt.addEventListener('click', toggleExpand);
+  const promptLabel = document.createElement('span');
+  promptLabel.className = 'label';
+  promptLabel.textContent = 'prompt:';
+  prompt.appendChild(promptLabel);
+  prompt.append(lastUserMessage(entry.messages || []));
+  body.appendChild(prompt);
+
+  if (entry.error) {
+    const err = document.createElement('div');
+    err.className = 'error-msg';
+    err.addEventListener('click', toggleExpand);
+    const errLabel = document.createElement('span');
+    errLabel.className = 'label';
+    errLabel.textContent = 'error:';
+    err.appendChild(errLabel);
+    err.append(entry.error);
+    body.appendChild(err);
+  } else if (entry.response) {
+    const resp = document.createElement('div');
+    resp.className = 'response';
+    resp.addEventListener('click', toggleExpand);
+    const respLabel = document.createElement('span');
+    respLabel.className = 'label';
+    respLabel.textContent = 'response:';
+    resp.appendChild(respLabel);
+    resp.append(entry.response.content || '');
+    body.appendChild(resp);
+
+    if (entry.response.usage) {
+      const usage = document.createElement('div');
+      usage.className = 'usage';
+      usage.textContent =
+        `${entry.response.usage.input_tokens} in / ${entry.response.usage.output_tokens} out tokens · ${entry.response.stop_reason}`;
+      body.appendChild(usage);
+    }
+  }
+
+  el.appendChild(body);
+  return el;
+}
+
+function connect() {
+  const es = new EventSource('/dashboard/events');
+
+  es.onopen = () => {
+    statusEl.textContent = 'connected';
+    statusEl.className = 'connected';
+  };
+
+  es.onerror = () => {
+    statusEl.textContent = 'disconnected — retrying…';
+    statusEl.className = 'disconnected';
+  };
+
+  es.onmessage = (ev) => {
+    let entry;
+    try {
+      entry = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    count++;
+    countEl.textContent = count + ' request' + (count === 1 ? '' : 's');
+    entriesEl.insertBefore(renderEntry(entry), entriesEl.firstChild);
+    while (entriesEl.children.length > MAX_ENTRIES) {
+      entriesEl.removeChild(entriesEl.lastChild);
+    }
+  };
+}
+
+connect();
+</script>
+</body>
+</html>
