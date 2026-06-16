@@ -18,12 +18,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Get OIDC token
-        id: oidc
-        run: |
-          TOKEN=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=crates.io" | jq -r '.value')
-          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
-
       - name: Publish
-        run: cargo publish --token "${{ steps.oidc.outputs.token }}"
+        run: |
+          OIDC_TOKEN=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=crates.io" | jq -r '.value')
+          CARGO_TOKEN=$(curl -sSf -X POST https://crates.io/api/v1/trusted_publishing/tokens \
+            -H "Content-Type: application/json" \
+            -d "{\"jwt\": \"$OIDC_TOKEN\"}" | jq -r '.token')
+          cargo publish --token "$CARGO_TOKEN"
