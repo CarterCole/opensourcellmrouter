@@ -31,7 +31,7 @@ git clone https://github.com/CarterCole/opensourcellmrouter
 cd opensourcellmrouter
 
 # Copy and edit the example config
-cp config.toml my-config.toml
+cp config.example.toml config.toml
 
 # Add API keys for any cloud providers you want
 echo 'OPENAI_API_KEY=sk-...' >> .env

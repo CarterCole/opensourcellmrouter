@@ -10,7 +10,7 @@ documentation = "https://github.com/CarterCole/opensourcellmrouter/tree/master/d
 readme = "README.md"
 keywords = ["llm", "ai", "proxy", "router", "ollama"]
 categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
-exclude = [".env", "logs/"]
+exclude = [".env", "logs/", "config.toml", "CLAUDE.md"]
 
 [dependencies]
 anyhow = "1.0.102"

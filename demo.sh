@@ -97,7 +97,11 @@ fi
 # ── 4. start router ───────────────────────────────────────────────────────────
 
 step "Starting opensourcellmrouter on :$ROUTER_PORT (config: $CONFIG)"
-[[ -f "$CONFIG" ]] || die "config file not found: $CONFIG"
+if [[ ! -f "$CONFIG" ]]; then
+    [[ -f config.example.toml ]] || die "config file not found: $CONFIG (and no config.example.toml to copy from)"
+    cp config.example.toml "$CONFIG"
+    ok "created $CONFIG from config.example.toml — edit it to suit your setup"
+fi
 if [[ -f .env ]]; then
     # shellcheck disable=SC1091
     set -a; source .env; set +a
