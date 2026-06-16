@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 set -e
 
-if [ -z "$1" ]; then
-  echo "Usage: ./release.sh <version>"
-  echo "Example: ./release.sh 0.2.0"
-  exit 1
-fi
+BUMP="${1:---minor}"
 
-VERSION="$1"
+CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+MINOR=$(echo "$CURRENT" | cut -d. -f2)
+PATCH=$(echo "$CURRENT" | cut -d. -f3)
 
-# Update version in Cargo.toml
+case "$BUMP" in
+  --major) VERSION="$((MAJOR + 1)).0.0" ;;
+  --minor) VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
+  --patch) VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+  *)       VERSION="${BUMP#v}" ;;  # explicit version like 1.2.3 or v1.2.3
+esac
+
+echo "Releasing $CURRENT → $VERSION"
+
 sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
-
-# Update Cargo.lock
 cargo update --workspace
 
 git add Cargo.toml Cargo.lock
 git commit -m "Release v$VERSION"
 git tag "v$VERSION"
-git push origin main
+git push origin master
 git push origin "v$VERSION"
