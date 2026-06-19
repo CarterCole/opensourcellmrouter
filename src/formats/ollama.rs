@@ -35,6 +35,11 @@ pub struct OllamaChatRequest {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<OllamaOptions>,
+    /// Structured-outputs config: either the literal `"json"` or a full JSON
+    /// Schema object. See
+    /// <https://docs.ollama.com/capabilities/structured-outputs>.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -112,6 +117,7 @@ impl From<&ChatRequest> for OllamaChatRequest {
             messages,
             stream: false,
             options,
+            format: req.output_schema.clone(),
         }
     }
 }
@@ -134,6 +140,7 @@ impl From<OllamaChatResponse> for ChatResponse {
                 input_tokens: resp.prompt_eval_count,
                 output_tokens: resp.eval_count,
             },
+            tags: Vec::new(),
         }
     }
 }
@@ -154,6 +161,10 @@ mod tests {
             }],
             max_tokens: Some(128),
             temperature: Some(0.5),
+            thinking: None,
+            effort: None,
+            task_budget: None,
+            output_schema: None,
             stream: false,
             plugins: Vec::new(),
             forced_provider: None,
@@ -168,6 +179,33 @@ mod tests {
         let options = ollama_req.options.expect("options should be set");
         assert_eq!(options.temperature, Some(0.5));
         assert_eq!(options.num_predict, Some(128));
+        assert_eq!(ollama_req.format, None);
+    }
+
+    #[test]
+    fn request_forwards_output_schema_as_format() {
+        let schema = serde_json::json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]});
+        let req = ChatRequest {
+            model: "llama3".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: "hi".to_string(),
+            }],
+            max_tokens: None,
+            temperature: None,
+            thinking: None,
+            effort: None,
+            task_budget: None,
+            output_schema: Some(schema.clone()),
+            stream: false,
+            plugins: Vec::new(),
+            forced_provider: None,
+            tags: Vec::new(),
+        };
+
+        let ollama_req = OllamaChatRequest::from(&req);
+        assert_eq!(ollama_req.format, Some(schema));
     }
 
     #[test]

@@ -66,6 +66,11 @@ impl Stats {
         for tag in &e.tags {
             *self.by_tag.entry(tag.clone()).or_default() += 1;
         }
+        if let Some(resp) = &e.response {
+            for tag in &resp.tags {
+                *self.by_tag.entry(tag.clone()).or_default() += 1;
+            }
+        }
     }
 
     fn avg_latency_ms(&self) -> u64 {
@@ -117,6 +122,9 @@ struct RoutedMeta {
     provider: String,
     sent_model: String,
     tags: Vec<String>,
+    /// Tags assigned by response classifiers after the provider replied
+    /// (e.g. `"refusal"`), see [`crate::classifiers::ResponseClassifier`].
+    response_tags: Vec<String>,
 }
 
 impl AppState {
@@ -161,6 +169,7 @@ impl AppState {
             provider: entry.provider.clone(),
             sent_model: entry.sent_model.clone(),
             tags: entry.tags.clone(),
+            response_tags: entry.response.as_ref().map(|r| r.tags.clone()).unwrap_or_default(),
         });
         self.events.push_front(entry);
         if self.events.len() > MAX_EVENTS {
@@ -574,6 +583,12 @@ fn entry_to_list_item(e: &LogEntry) -> ListItem<'static> {
         header.push(Span::raw("  "));
         header.push(Span::styled(format!("({plugin})"), Style::default().fg(Color::Magenta)));
     }
+    if let Some(resp) = &e.response {
+        for tag in &resp.tags {
+            header.push(Span::raw("  "));
+            header.push(Span::styled(format!("<{tag}>"), Style::default().fg(Color::Red)));
+        }
+    }
 
     let dur_color = if e.error.is_some() { Color::Red } else { Color::DarkGray };
     header.push(Span::styled(
@@ -729,6 +744,9 @@ fn render_chat(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
         let mut t = format!(" {} / {} ", meta.provider, meta.sent_model);
         for tag in &meta.tags {
             t.push_str(&format!("[{tag}] "));
+        }
+        for tag in &meta.response_tags {
+            t.push_str(&format!("<{tag}> "));
         }
         t
     } else {

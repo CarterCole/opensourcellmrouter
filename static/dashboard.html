@@ -76,6 +76,7 @@
   }
   .pill.tag { border-color: #3a4a6b; color: #9cc0ff; }
   .pill.plugin { border-color: #4a3a6b; color: #c39cff; }
+  .pill.response-tag { border-color: #6b3a3a; color: #ff9c9c; }
   .body { margin-top: 0.4rem; display: grid; gap: 0.3rem; }
   .prompt, .response, .error-msg {
     font-size: 0.8rem;
@@ -176,6 +177,7 @@ function renderEntry(entry) {
 
   for (const tag of entry.tags || []) row1.appendChild(pill(tag, 'tag'));
   for (const plugin of entry.plugins || []) row1.appendChild(pill(plugin, 'plugin'));
+  for (const tag of (entry.response && entry.response.tags) || []) row1.appendChild(pill(tag, 'response-tag'));
 
   const duration = document.createElement('span');
   duration.className = 'duration';

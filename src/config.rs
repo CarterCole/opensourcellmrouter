@@ -24,6 +24,11 @@ pub struct Config {
     /// id (e.g. `[classifiers.keyword]`). See [`crate::classifiers`].
     #[serde(default)]
     pub classifiers: HashMap<String, ClassifierEntryConfig>,
+    /// Classifiers run on every response after the provider replies, keyed
+    /// by classifier id (e.g. `[response_classifiers.refusal]`). See
+    /// [`crate::classifiers::ResponseClassifier`].
+    #[serde(default)]
+    pub response_classifiers: HashMap<String, ClassifierEntryConfig>,
 }
 
 /// Server-side configuration for one plugin or classifier: whether it's

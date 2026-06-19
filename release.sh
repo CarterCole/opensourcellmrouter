@@ -17,7 +17,7 @@ esac
 
 echo "Releasing $CURRENT → $VERSION"
 
-sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 cargo update --workspace
 
 git add Cargo.toml Cargo.lock

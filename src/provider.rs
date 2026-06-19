@@ -238,6 +238,9 @@ impl Provider {
             .post(&url)
             .header("anthropic-version", "2023-06-01")
             .json(&body);
+        if let Some(beta) = anthropic_beta_header(req) {
+            rb = rb.header("anthropic-beta", beta);
+        }
         if let Some(key) = self.api_key()? {
             rb = rb.header("x-api-key", key);
         }
@@ -279,5 +282,51 @@ impl Provider {
         let parsed: ollama::OllamaChatResponse = serde_json::from_str(&text)
             .with_context(|| format!("parsing response from provider '{}': {}", self.name, text))?;
         Ok(parsed.into())
+    }
+}
+
+/// `anthropic-beta` header value(s) required to forward `req`'s Anthropic-only
+/// fields, or `None` if the request uses no beta features. Currently only
+/// `task_budget` is beta-gated — `thinking`/`effort` need no header.
+fn anthropic_beta_header(req: &ChatRequest) -> Option<&'static str> {
+    if req.task_budget.is_some() {
+        Some("task-budgets-2026-03-13")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request(task_budget: Option<serde_json::Value>) -> ChatRequest {
+        ChatRequest {
+            model: "claude-opus-4-8".to_string(),
+            system: None,
+            messages: Vec::new(),
+            max_tokens: Some(1024),
+            temperature: None,
+            thinking: None,
+            effort: None,
+            task_budget,
+            output_schema: None,
+            stream: false,
+            plugins: Vec::new(),
+            forced_provider: None,
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn no_beta_header_without_task_budget() {
+        assert_eq!(anthropic_beta_header(&request(None)), None);
+    }
+
+    #[test]
+    fn task_budget_requires_beta_header() {
+        let req = request(Some(json!({"type": "tokens", "total": 64000})));
+        assert_eq!(anthropic_beta_header(&req), Some("task-budgets-2026-03-13"));
     }
 }

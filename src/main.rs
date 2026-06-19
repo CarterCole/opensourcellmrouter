@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
 
     let plugin_registry = Arc::new(plugins::PluginRegistry::from_config(&config));
     let classifier_registry = Arc::new(classifiers::ClassifierRegistry::from_config(&config));
+    let response_classifier_registry = Arc::new(classifiers::ResponseClassifierRegistry::from_config(&config));
 
     let (events, _) = tokio::sync::broadcast::channel(256);
 
@@ -68,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
             logger,
             plugins: plugin_registry,
             classifiers: classifier_registry,
+            response_classifiers: response_classifier_registry,
             events,
             in_flight: Arc::new(AtomicU64::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),

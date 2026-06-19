@@ -23,6 +23,10 @@ pub struct OpenAiChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Structured-outputs config: `{"type": "json_schema", "json_schema": {...}}`.
+    /// See <https://developers.openai.com/api/docs/guides/structured-outputs>.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
     #[serde(default)]
     pub stream: bool,
     /// Plugins to run for this request, e.g. `[{"id": "response-healing"}]`.
@@ -30,6 +34,26 @@ pub struct OpenAiChatRequest {
     /// since it's stripped before forwarding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plugins: Vec<PluginRequest>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    pub json_schema: JsonSchemaFormat,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JsonSchemaFormat {
+    #[serde(default = "default_schema_name")]
+    pub name: String,
+    pub schema: serde_json::Value,
+    #[serde(default)]
+    pub strict: bool,
+}
+
+fn default_schema_name() -> String {
+    "response".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -80,12 +104,21 @@ impl From<OpenAiChatRequest> for ChatRequest {
             }
         }
 
+        let output_schema = req
+            .response_format
+            .filter(|f| f.format_type == "json_schema")
+            .map(|f| f.json_schema.schema);
+
         ChatRequest {
             model: req.model,
             system,
             messages,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
+            thinking: None,
+            effort: None,
+            task_budget: None,
+            output_schema,
             stream: req.stream,
             plugins: req.plugins,
             forced_provider: None,
@@ -117,11 +150,21 @@ impl From<&ChatRequest> for OpenAiChatRequest {
             });
         }
 
+        let response_format = req.output_schema.clone().map(|schema| ResponseFormat {
+            format_type: "json_schema".to_string(),
+            json_schema: JsonSchemaFormat {
+                name: default_schema_name(),
+                schema,
+                strict: true,
+            },
+        });
+
         OpenAiChatRequest {
             model: req.model.clone(),
             messages,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
+            response_format,
             stream: false,
             plugins: Vec::new(),
         }
@@ -151,6 +194,7 @@ impl From<OpenAiChatResponse> for ChatResponse {
                 input_tokens: resp.usage.prompt_tokens,
                 output_tokens: resp.usage.completion_tokens,
             },
+            tags: Vec::new(),
         }
     }
 }
@@ -182,5 +226,88 @@ impl From<ChatResponse> for OpenAiChatResponse {
                 total_tokens: resp.usage.input_tokens + resp.usage.output_tokens,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn chat_request(output_schema: Option<serde_json::Value>) -> ChatRequest {
+        ChatRequest {
+            model: "gpt-4o".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: "hi".to_string(),
+            }],
+            max_tokens: None,
+            temperature: None,
+            thinking: None,
+            effort: None,
+            task_budget: None,
+            output_schema,
+            stream: false,
+            plugins: Vec::new(),
+            forced_provider: None,
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn inbound_response_format_extracts_schema() {
+        let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"], "additionalProperties": false});
+        let req = OpenAiChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![OpenAiMessage { role: "user".to_string(), content: "hi".to_string() }],
+            max_tokens: None,
+            temperature: None,
+            response_format: Some(ResponseFormat {
+                format_type: "json_schema".to_string(),
+                json_schema: JsonSchemaFormat { name: "contact".to_string(), schema: schema.clone(), strict: true },
+            }),
+            stream: false,
+            plugins: Vec::new(),
+        };
+
+        let chat: ChatRequest = req.into();
+        assert_eq!(chat.output_schema, Some(schema));
+    }
+
+    #[test]
+    fn inbound_without_response_format_leaves_output_schema_none() {
+        let req = OpenAiChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![OpenAiMessage { role: "user".to_string(), content: "hi".to_string() }],
+            max_tokens: None,
+            temperature: None,
+            response_format: None,
+            stream: false,
+            plugins: Vec::new(),
+        };
+
+        let chat: ChatRequest = req.into();
+        assert_eq!(chat.output_schema, None);
+    }
+
+    #[test]
+    fn outbound_output_schema_wrapped_as_strict_json_schema_response_format() {
+        let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"], "additionalProperties": false});
+        let chat = chat_request(Some(schema.clone()));
+        let req = OpenAiChatRequest::from(&chat);
+
+        let format = req.response_format.unwrap();
+        assert_eq!(format.format_type, "json_schema");
+        assert_eq!(format.json_schema.schema, schema);
+        assert!(format.json_schema.strict);
+        assert_eq!(format.json_schema.name, "response");
+    }
+
+    #[test]
+    fn outbound_without_output_schema_omits_response_format() {
+        let chat = chat_request(None);
+        let req = OpenAiChatRequest::from(&chat);
+        assert!(req.response_format.is_none());
     }
 }

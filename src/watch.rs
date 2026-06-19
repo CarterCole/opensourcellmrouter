@@ -106,6 +106,11 @@ fn print_entry(e: &LogEntry) {
     for plugin in &e.plugins {
         header.push_str(&format!("  {MAGENTA}({plugin}){RESET}"));
     }
+    if let Some(resp) = &e.response {
+        for tag in &resp.tags {
+            header.push_str(&format!("  {RED}<{tag}>{RESET}"));
+        }
+    }
 
     let dur_color = if e.error.is_some() { RED } else { DIM };
     header.push_str(&format!("  {dur_color}{}ms{RESET}", e.duration_ms));

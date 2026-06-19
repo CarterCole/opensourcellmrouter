@@ -94,6 +94,14 @@ code   = ["function", "class", "import", "def ", "fn ", "bug", "error", "stack t
 nsfw   = ["nsfw", "adult", "explicit", "erotic", "nude", "naked",
           "sexual", "xxx", "porn", "hentai", "fetish", "lewd"]
 
+# ── response classifiers ────────────────────────────────────────────────────────
+# Tag the response after the provider replies (e.g. detect refusals). Tags land
+# in the X-Router-Tags response header and in logs/dashboard — never in the
+# OpenAI/Anthropic response body.
+
+[response_classifiers.refusal]
+enabled = true
+
 # ── routers (first match wins) ────────────────────────────────────────────────
 
 # Pick a random model from everything we have — applies to every request.

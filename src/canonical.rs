@@ -30,6 +30,25 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Anthropic-only extended-thinking config (e.g. `{"type": "adaptive"}`),
+    /// passed through opaquely. Ignored by OpenAI/Ollama providers, which
+    /// have no equivalent.
+    pub thinking: Option<serde_json::Value>,
+    /// Anthropic-only `output_config.effort` value (`"low"`..`"max"`).
+    /// Ignored by OpenAI/Ollama providers.
+    pub effort: Option<String>,
+    /// Anthropic-only `output_config.task_budget` (e.g.
+    /// `{"type": "tokens", "total": 64000}`), passed through opaquely.
+    /// Forwarding this requires the `task-budgets-2026-03-13` beta header on
+    /// the outbound request — see `provider::anthropic_beta_header`. Ignored
+    /// by OpenAI/Ollama providers.
+    pub task_budget: Option<serde_json::Value>,
+    /// JSON Schema the response must conform to ("structured outputs").
+    /// Unlike `thinking`/`effort`/`task_budget` this is *not* Anthropic-only —
+    /// it's translated into each provider's native mechanism: Anthropic
+    /// `output_config.format`, OpenAI `response_format.json_schema.schema`,
+    /// Ollama's top-level `format`. See `docs/structured-outputs.md`.
+    pub output_schema: Option<serde_json::Value>,
     pub stream: bool,
     /// Plugins requested for this call, e.g. `{"id": "response-healing"}`.
     /// Not forwarded to providers.
@@ -75,4 +94,14 @@ pub struct ChatResponse {
     pub content: String,
     pub stop_reason: StopReason,
     pub usage: Usage,
+    /// Tags assigned by [`crate::classifiers`]' response classifiers (e.g.
+    /// `"refusal"`), after the provider has replied. Kept separate from the
+    /// request's classifier tags (`ChatRequest.tags`) — see
+    /// [`crate::server::dispatch`], which surfaces each as its own
+    /// `X-Router-*-Tags` response header rather than merging them. Never
+    /// mapped into the OpenAI/Anthropic wire response — see
+    /// `formats::openai`/`formats::anthropic`, whose `From<ChatResponse>`
+    /// impls don't map this field — so the response body stays unmodified.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }

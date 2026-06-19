@@ -13,13 +13,14 @@ cargo install opensourcellmrouter
 Every request arrives on an OpenAI-compatible (`/v1/chat/completions`) or Anthropic-compatible (`/v1/messages`) endpoint and flows through:
 
 ```
-request → classifiers → plugins → router → provider → plugins → response
+request → classifiers → plugins → router → provider → plugins → response classifiers → response
 ```
 
 - **Classifiers** tag the request (e.g. `vision`, `code`, `nsfw`) based on content.
 - **Router rules** pick a provider based on tags, cost, latency, throughput, model name prefix, discovered Ollama models, or at random. Rules are evaluated in order; first match wins.
 - **Plugins** can mutate the request/response or force a specific provider.
 - The chosen **provider** receives the (possibly rewritten) request and returns a response.
+- **Response classifiers** tag the response after it comes back (e.g. `refusal`), surfaced via the `X-Router-Response-Tags` header (request-side tags get their own `X-Router-Request-Tags` header) — the OpenAI/Anthropic response body is never modified.
 - Every exchange is logged as JSONL and broadcast live to the dashboard.
 
 ---
@@ -225,6 +226,21 @@ nsfw   = ["nsfw", "adult", "explicit"]
 ```
 
 Tags are available to `tag` router rules and appear in logs and the dashboard.
+
+There's also a response-side counterpart: `[response_classifiers.<id>]` tags
+the response *after* the provider replies, e.g. to flag a refusal:
+
+```toml
+[response_classifiers.refusal]
+enabled = true
+```
+
+Every response carries six `X-Router-*` headers without ever touching the
+OpenAI/Anthropic response body: `X-Router-Request-Tags` (e.g. `vision`),
+`X-Router-Response-Tags` (e.g. `refusal`), `X-Router-Provider` (which
+provider handled it), `X-Router-Model` (the model actually sent), and
+`X-Router-Input-Tokens`/`X-Router-Output-Tokens` (token usage). The same data
+shows up in logs/dashboard. See [`docs/classifiers.md`](docs/classifiers.md#response-classifiers).
 
 ---
 
