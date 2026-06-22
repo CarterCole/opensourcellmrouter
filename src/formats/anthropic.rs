@@ -5,9 +5,17 @@
 //! request from a client, and when it forwards a request to a provider that
 //! itself speaks the Anthropic Messages API.
 
+use bytes::Bytes;
+use futures_core::Stream;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
-use crate::canonical::{ChatRequest, ChatResponse, Message, PluginRequest, Role, StopReason, Usage};
+use crate::canonical::{
+    ChatRequest, ChatResponse, ContentPart, Message, PluginRequest, Role, StopReason, StreamEvent,
+    Tool, ToolCall, Usage,
+};
 
 /// `content` may be a plain string or a list of content blocks. Anthropic
 /// accepts both shapes on input; only blocks are accepted on output, but we
@@ -19,41 +27,85 @@ pub enum AnthropicContent {
     Blocks(Vec<ContentBlock>),
 }
 
-impl AnthropicContent {
-    pub fn into_text(self) -> String {
-        match self {
-            AnthropicContent::Text(text) => text,
-            AnthropicContent::Blocks(blocks) => blocks
-                .into_iter()
-                .filter(|b| b.block_type == "text")
-                .map(|b| b.text)
-                .collect::<Vec<_>>()
-                .join(""),
-        }
-    }
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text { text: String },
+    Image { source: ImageSource },
+    ToolUse { id: String, name: String, input: serde_json::Value },
+    ToolResult { tool_use_id: String, content: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ContentBlock {
+pub struct ImageSource {
     #[serde(rename = "type")]
-    pub block_type: String,
-    #[serde(default)]
-    pub text: String,
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
 }
 
-impl ContentBlock {
-    pub fn text(text: impl Into<String>) -> Self {
-        ContentBlock {
-            block_type: "text".to_string(),
-            text: text.into(),
-        }
+fn content_parts_from_anthropic(content: AnthropicContent) -> Vec<ContentPart> {
+    match content {
+        AnthropicContent::Text(text) => vec![ContentPart::Text { text }],
+        AnthropicContent::Blocks(blocks) => blocks
+            .into_iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => ContentPart::Text { text },
+                ContentBlock::Image { source } => {
+                    ContentPart::Image { media_type: source.media_type, data: source.data }
+                }
+                ContentBlock::ToolUse { id, name, input } => ContentPart::ToolUse { id, name, input },
+                ContentBlock::ToolResult { tool_use_id, content } => {
+                    ContentPart::ToolResult { tool_use_id, content }
+                }
+            })
+            .collect(),
     }
+}
+
+fn anthropic_content_from_parts(parts: &[ContentPart]) -> AnthropicContent {
+    // Collapse the common "single text part" case back to a bare string, so
+    // a no-tools/no-images request produces the same JSON shape as before
+    // this type existed.
+    if let [ContentPart::Text { text }] = parts {
+        return AnthropicContent::Text(text.clone());
+    }
+
+    AnthropicContent::Blocks(
+        parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => ContentBlock::Text { text: text.clone() },
+                ContentPart::Image { media_type, data } => ContentBlock::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: media_type.clone(),
+                        data: data.clone(),
+                    },
+                },
+                ContentPart::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse { id: id.clone(), name: name.clone(), input: input.clone() }
+                }
+                ContentPart::ToolResult { tool_use_id, content } => {
+                    ContentBlock::ToolResult { tool_use_id: tool_use_id.clone(), content: content.clone() }
+                }
+            })
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicMessage {
     pub role: String,
     pub content: AnthropicContent,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnthropicTool {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -71,6 +123,8 @@ pub struct AnthropicMessagesRequest {
     pub thinking: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<AnthropicTool>,
     #[serde(default)]
     pub stream: bool,
     /// Plugins to run for this request, e.g. `[{"id": "response-healing"}]`.
@@ -139,7 +193,7 @@ impl From<AnthropicMessagesRequest> for ChatRequest {
                     "assistant" => Role::Assistant,
                     _ => Role::User,
                 },
-                content: msg.content.into_text(),
+                content: content_parts_from_anthropic(msg.content),
             })
             .collect();
 
@@ -147,6 +201,12 @@ impl From<AnthropicMessagesRequest> for ChatRequest {
             Some(c) => (c.effort, c.task_budget, c.format.map(|f| f.schema)),
             None => (None, None, None),
         };
+
+        let tools = req
+            .tools
+            .into_iter()
+            .map(|t| Tool { name: t.name, description: t.description, input_schema: t.input_schema })
+            .collect();
 
         ChatRequest {
             model: req.model,
@@ -158,6 +218,7 @@ impl From<AnthropicMessagesRequest> for ChatRequest {
             effort,
             task_budget,
             output_schema,
+            tools,
             stream: req.stream,
             plugins: req.plugins,
             forced_provider: None,
@@ -177,7 +238,7 @@ impl From<&ChatRequest> for AnthropicMessagesRequest {
                     Role::Assistant => "assistant".to_string(),
                     Role::User => "user".to_string(),
                 },
-                content: AnthropicContent::Text(msg.content.clone()),
+                content: anthropic_content_from_parts(&msg.content),
             })
             .collect();
 
@@ -194,6 +255,16 @@ impl From<&ChatRequest> for AnthropicMessagesRequest {
             None
         };
 
+        let tools = req
+            .tools
+            .iter()
+            .map(|t| AnthropicTool {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                input_schema: t.input_schema.clone(),
+            })
+            .collect();
+
         AnthropicMessagesRequest {
             model: req.model.clone(),
             max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
@@ -202,7 +273,8 @@ impl From<&ChatRequest> for AnthropicMessagesRequest {
             temperature: req.temperature,
             thinking: req.thinking.clone(),
             output_config,
-            stream: false,
+            tools,
+            stream: req.stream,
             plugins: Vec::new(),
         }
     }
@@ -211,17 +283,20 @@ impl From<&ChatRequest> for AnthropicMessagesRequest {
 /// A reply from a provider that speaks the Anthropic format.
 impl From<AnthropicMessagesResponse> for ChatResponse {
     fn from(resp: AnthropicMessagesResponse) -> Self {
-        let content = resp
-            .content
-            .into_iter()
-            .filter(|b| b.block_type == "text")
-            .map(|b| b.text)
-            .collect::<Vec<_>>()
-            .join("");
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        for block in resp.content {
+            match block {
+                ContentBlock::Text { text } => content.push_str(&text),
+                ContentBlock::ToolUse { id, name, input } => tool_calls.push(ToolCall { id, name, input }),
+                ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => {}
+            }
+        }
 
         let stop_reason = match resp.stop_reason.as_deref() {
             Some("end_turn") => StopReason::EndTurn,
             Some("max_tokens") => StopReason::MaxTokens,
+            Some("tool_use") => StopReason::ToolUse,
             _ => StopReason::Other,
         };
 
@@ -230,6 +305,7 @@ impl From<AnthropicMessagesResponse> for ChatResponse {
             model: resp.model,
             content,
             stop_reason,
+            tool_calls,
             usage: Usage {
                 input_tokens: resp.usage.input_tokens,
                 output_tokens: resp.usage.output_tokens,
@@ -242,18 +318,22 @@ impl From<AnthropicMessagesResponse> for ChatResponse {
 /// A reply rendered for a client that speaks the Anthropic format.
 impl From<ChatResponse> for AnthropicMessagesResponse {
     fn from(resp: ChatResponse) -> Self {
-        let stop_reason = match resp.stop_reason {
-            StopReason::EndTurn => "end_turn",
-            StopReason::MaxTokens => "max_tokens",
-            StopReason::Other => "end_turn",
-        };
+        let stop_reason = stop_reason_to_anthropic(resp.stop_reason);
+
+        let mut content = Vec::new();
+        if !resp.content.is_empty() {
+            content.push(ContentBlock::Text { text: resp.content });
+        }
+        for tc in resp.tool_calls {
+            content.push(ContentBlock::ToolUse { id: tc.id, name: tc.name, input: tc.input });
+        }
 
         AnthropicMessagesResponse {
             id: resp.id,
             response_type: "message".to_string(),
             role: "assistant".to_string(),
             model: resp.model,
-            content: vec![ContentBlock::text(resp.content)],
+            content,
             stop_reason: Some(stop_reason.to_string()),
             usage: AnthropicUsage {
                 input_tokens: resp.usage.input_tokens,
@@ -261,6 +341,134 @@ impl From<ChatResponse> for AnthropicMessagesResponse {
             },
         }
     }
+}
+
+/// Shared between the non-streaming response renderer above and
+/// [`render_stream`]'s closing `message_delta` event.
+fn stop_reason_to_anthropic(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::ToolUse => "tool_use",
+        StopReason::Other => "end_turn",
+    }
+}
+
+/// A content block currently open in the synthesized Anthropic event stream.
+/// Anthropic requires every block to be explicitly started and stopped, and
+/// only one may be open at a time — tracked here so [`render_stream`] knows
+/// when to close the previous block before opening the next.
+enum OpenBlock {
+    Text,
+    ToolUse,
+}
+
+/// Renders a canonical stream as the real Anthropic Messages SSE event
+/// sequence (`message_start` / `content_block_*` / `message_delta` /
+/// `message_stop`) — the shape Claude Code's streaming parser expects.
+pub fn render_stream<S>(mut events: S, model: String) -> ReceiverStream<anyhow::Result<Bytes>>
+where
+    S: Stream<Item = anyhow::Result<StreamEvent>> + Unpin + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+    tokio::spawn(async move {
+        let msg_id = format!(
+            "msg_{:x}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+
+        macro_rules! send {
+            ($event_name:expr, $data:expr) => {
+                if tx.send(Ok(Bytes::from(format!("event: {}\ndata: {}\n\n", $event_name, $data)))).await.is_err() {
+                    return;
+                }
+            };
+        }
+
+        send!(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            })
+        );
+
+        let mut block_index: i64 = -1;
+        let mut open_block: Option<OpenBlock> = None;
+
+        while let Some(item) = events.next().await {
+            let event = match item {
+                Ok(e) => e,
+                Err(err) => {
+                    tx.send(Err(err)).await.ok();
+                    return;
+                }
+            };
+
+            match event {
+                StreamEvent::TextDelta { text } => {
+                    if !matches!(open_block, Some(OpenBlock::Text)) {
+                        if open_block.is_some() {
+                            send!("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
+                        }
+                        block_index += 1;
+                        open_block = Some(OpenBlock::Text);
+                        send!(
+                            "content_block_start",
+                            json!({"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}})
+                        );
+                    }
+                    send!(
+                        "content_block_delta",
+                        json!({"type": "content_block_delta", "index": block_index, "delta": {"type": "text_delta", "text": text}})
+                    );
+                }
+                StreamEvent::ToolCallStart { id, name } => {
+                    if open_block.is_some() {
+                        send!("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
+                    }
+                    block_index += 1;
+                    open_block = Some(OpenBlock::ToolUse);
+                    send!(
+                        "content_block_start",
+                        json!({"type": "content_block_start", "index": block_index, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}})
+                    );
+                }
+                StreamEvent::ToolCallDelta { partial_input, .. } => {
+                    send!(
+                        "content_block_delta",
+                        json!({"type": "content_block_delta", "index": block_index, "delta": {"type": "input_json_delta", "partial_json": partial_input}})
+                    );
+                }
+                StreamEvent::Done { stop_reason, usage } => {
+                    if open_block.is_some() {
+                        send!("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
+                    }
+                    send!(
+                        "message_delta",
+                        json!({
+                            "type": "message_delta",
+                            "delta": {"stop_reason": stop_reason_to_anthropic(stop_reason), "stop_sequence": null},
+                            "usage": {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
+                        })
+                    );
+                    send!("message_stop", json!({"type": "message_stop"}));
+                    return;
+                }
+            }
+        }
+    });
+
+    ReceiverStream::new(rx)
 }
 
 #[cfg(test)]
@@ -298,6 +506,7 @@ mod tests {
             temperature: None,
             thinking,
             output_config,
+            tools: Vec::new(),
             stream: false,
             plugins: Vec::new(),
         }
@@ -312,21 +521,27 @@ mod tests {
         ChatRequest {
             model: "claude-opus-4-8".to_string(),
             system: None,
-            messages: vec![Message {
-                role: Role::User,
-                content: "hi".to_string(),
-            }],
+            messages: vec![Message::text(Role::User, "hi")],
             max_tokens: Some(1024),
             temperature: None,
             thinking,
             effort: effort.map(str::to_string),
             task_budget,
             output_schema,
+            tools: Vec::new(),
             stream: false,
             plugins: Vec::new(),
             forced_provider: None,
             tags: Vec::new(),
         }
+    }
+
+    #[test]
+    fn inbound_stream_flag_survives_into_chat_request() {
+        let mut req = anthropic_request(None, None, None, None);
+        req.stream = true;
+        let chat: ChatRequest = req.into();
+        assert!(chat.stream);
     }
 
     #[test]
@@ -413,5 +628,211 @@ mod tests {
             value["output_config"],
             json!({"effort": "high", "task_budget": budget, "format": {"type": "json_schema", "schema": schema}})
         );
+    }
+
+    #[test]
+    fn inbound_tool_use_and_tool_result_blocks_round_trip() {
+        let req = AnthropicMessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            system: None,
+            messages: vec![
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: AnthropicContent::Blocks(vec![ContentBlock::ToolUse {
+                        id: "toolu_1".to_string(),
+                        name: "get_weather".to_string(),
+                        input: json!({"city": "nyc"}),
+                    }]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: "toolu_1".to_string(),
+                        content: "sunny".to_string(),
+                    }]),
+                },
+            ],
+            temperature: None,
+            thinking: None,
+            output_config: None,
+            tools: Vec::new(),
+            stream: false,
+            plugins: Vec::new(),
+        };
+
+        let chat: ChatRequest = req.into();
+        assert_eq!(
+            chat.messages[0].content,
+            vec![ContentPart::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "get_weather".to_string(),
+                input: json!({"city": "nyc"}),
+            }]
+        );
+        assert_eq!(
+            chat.messages[1].content,
+            vec![ContentPart::ToolResult { tool_use_id: "toolu_1".to_string(), content: "sunny".to_string() }]
+        );
+    }
+
+    #[test]
+    fn inbound_image_block_maps_to_image_content_part() {
+        let req = AnthropicMessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Blocks(vec![ContentBlock::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: "abc123".to_string(),
+                    },
+                }]),
+            }],
+            temperature: None,
+            thinking: None,
+            output_config: None,
+            tools: Vec::new(),
+            stream: false,
+            plugins: Vec::new(),
+        };
+
+        let chat: ChatRequest = req.into();
+        assert_eq!(
+            chat.messages[0].content,
+            vec![ContentPart::Image { media_type: "image/png".to_string(), data: "abc123".to_string() }]
+        );
+    }
+
+    #[test]
+    fn outbound_single_text_part_collapses_to_bare_string() {
+        let chat = chat_request(None, None, None, None);
+        let req = AnthropicMessagesRequest::from(&chat);
+        match &req.messages[0].content {
+            AnthropicContent::Text(text) => assert_eq!(text, "hi"),
+            AnthropicContent::Blocks(_) => panic!("expected bare string content"),
+        }
+    }
+
+    #[test]
+    fn outbound_tools_list_maps_to_input_schema() {
+        let mut chat = chat_request(None, None, None, None);
+        chat.tools = vec![Tool {
+            name: "get_weather".to_string(),
+            description: Some("Looks up weather".to_string()),
+            input_schema: json!({"type": "object"}),
+        }];
+        let req = AnthropicMessagesRequest::from(&chat);
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, "get_weather");
+        assert_eq!(req.tools[0].input_schema, json!({"type": "object"}));
+    }
+
+    #[test]
+    fn response_tool_use_block_parsed_into_tool_calls() {
+        let resp = AnthropicMessagesResponse {
+            id: "1".to_string(),
+            response_type: "message".to_string(),
+            role: "assistant".to_string(),
+            model: "claude-opus-4-8".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "get_weather".to_string(),
+                input: json!({"city": "nyc"}),
+            }],
+            stop_reason: Some("tool_use".to_string()),
+            usage: AnthropicUsage::default(),
+        };
+
+        let chat: ChatResponse = resp.into();
+        assert_eq!(chat.stop_reason, StopReason::ToolUse);
+        assert_eq!(chat.tool_calls.len(), 1);
+        assert_eq!(chat.tool_calls[0].name, "get_weather");
+    }
+
+    fn events_stream(
+        events: Vec<StreamEvent>,
+    ) -> impl Stream<Item = anyhow::Result<StreamEvent>> + Unpin + Send + 'static {
+        tokio_stream::iter(events.into_iter().map(Ok))
+    }
+
+    /// Splits a concatenated SSE byte stream into `(event_name, data_json)`
+    /// pairs, one per `event: ...\ndata: ...\n\n` block.
+    async fn render_to_events(events: Vec<StreamEvent>, model: &str) -> Vec<(String, serde_json::Value)> {
+        let mut stream = render_stream(events_stream(events), model.to_string());
+        let mut out = String::new();
+        while let Some(item) = stream.next().await {
+            out.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+
+        out.split("\n\n")
+            .filter(|block| !block.is_empty())
+            .map(|block| {
+                let mut lines = block.lines();
+                let event_name = lines.next().unwrap().trim_start_matches("event: ").to_string();
+                let data = lines.next().unwrap().trim_start_matches("data: ");
+                (event_name, serde_json::from_str(data).unwrap())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn render_stream_text_only_opens_and_closes_one_text_block() {
+        let events = render_to_events(
+            vec![
+                StreamEvent::TextDelta { text: "hi".to_string() },
+                StreamEvent::TextDelta { text: " there".to_string() },
+                StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: Usage { input_tokens: 1, output_tokens: 2 } },
+            ],
+            "claude-opus-4-8",
+        )
+        .await;
+
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[1].1["content_block"]["type"], "text");
+        assert_eq!(events[2].1["delta"]["text"], "hi");
+        assert_eq!(events[3].1["delta"]["text"], " there");
+        assert_eq!(events[5].1["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events[5].1["usage"]["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn render_stream_tool_use_opens_tool_block_with_id_and_name() {
+        let events = render_to_events(
+            vec![
+                StreamEvent::ToolCallStart { id: "toolu_1".to_string(), name: "get_weather".to_string() },
+                StreamEvent::ToolCallDelta { id: "toolu_1".to_string(), partial_input: r#"{"city":"nyc"}"#.to_string() },
+                StreamEvent::Done { stop_reason: StopReason::ToolUse, usage: Usage::default() },
+            ],
+            "claude-opus-4-8",
+        )
+        .await;
+
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
+        );
+        assert_eq!(events[1].1["content_block"]["type"], "tool_use");
+        assert_eq!(events[1].1["content_block"]["id"], "toolu_1");
+        assert_eq!(events[1].1["content_block"]["name"], "get_weather");
+        assert_eq!(events[2].1["delta"]["type"], "input_json_delta");
+        assert_eq!(events[2].1["delta"]["partial_json"], r#"{"city":"nyc"}"#);
+        assert_eq!(events[4].1["delta"]["stop_reason"], "tool_use");
     }
 }

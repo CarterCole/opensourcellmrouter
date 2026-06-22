@@ -38,6 +38,7 @@ cp config.example.toml config.toml
 echo 'OPENAI_API_KEY=sk-...' >> .env
 echo 'ANTHROPIC_API_KEY=sk-ant-...' >> .env
 echo 'CLOUDFLARE_API_TOKEN=cfat_...' >> .env
+echo 'XAI_API_KEY=xai-...' >> .env
 
 # Build and run
 cargo run -- my-config.toml
@@ -59,7 +60,7 @@ Each `[[providers]]` entry is an upstream backend. Three wire formats are suppor
 
 | `format` | Speaks | Example |
 |---|---|---|
-| `openai` | OpenAI chat completions API | OpenAI, llama-server, vLLM, Cloudflare Workers AI |
+| `openai` | OpenAI chat completions API | OpenAI, llama-server, vLLM, Cloudflare Workers AI, xAI (Grok) |
 | `anthropic` | Anthropic Messages API | Anthropic Claude |
 | `ollama` | Ollama native API (`/api/chat`) | Local Ollama instance |
 
@@ -107,16 +108,18 @@ base_url           = "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>
 api_key_env        = "CLOUDFLARE_API_TOKEN"
 cost_per_1m_tokens = 0.2
 quality            = 80
-```
 
-**API keys** go in `.env` (gitignored) and are sourced automatically by `demo.sh`, or export them in your shell before running. A missing key logs a warning and keeps the provider available — the first request that hits it will fail. Set `strict = true` on a provider to skip it at startup instead:
-
-```toml
+# xAI (Grok) — OpenAI-compatible (key read from $XAI_API_KEY)
 [[providers]]
-name        = "openai"
-strict      = true   # skipped at startup if OPENAI_API_KEY is unset
-api_key_env = "OPENAI_API_KEY"
+name               = "xai"
+format             = "openai"
+base_url           = "https://api.x.ai/v1"
+api_key_env        = "XAI_API_KEY"
+cost_per_1m_tokens = 5.0
+quality            = 88
 ```
+
+**API keys** go in `.env` (gitignored) and are sourced automatically by `demo.sh`, or export them in your shell before running. A provider with a missing key is skipped automatically at startup (logged as a warning) — it's never selected by any router rule.
 
 ---
 
@@ -314,6 +317,8 @@ enabled = true
 | Plugins | [`docs/plugins.md`](docs/plugins.md) |
 | Pipeline overview | [`docs/README.md`](docs/README.md) |
 | Examples | [`docs/examples.md`](docs/examples.md) |
+| Coding agents (Claude Code, Copilot CLI, Codex) | [`docs/coding-agents.md`](docs/coding-agents.md) |
+| Security (`host`, `api_key_env`) | [`docs/security.md`](docs/security.md) |
 
 ---
 

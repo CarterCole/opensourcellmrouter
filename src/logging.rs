@@ -69,6 +69,11 @@ pub struct LogEntry {
     /// Tags assigned by `classifiers` before routing (see
     /// [`crate::classifiers`]), e.g. `["vision"]`.
     pub tags: Vec<String>,
+    /// OTel trace id for this request (hex string), if telemetry is enabled.
+    /// Lets a JSONL log line be pasted straight into a tracing backend's
+    /// search to find the matching trace.
+    #[serde(default)]
+    pub trace_id: Option<String>,
     /// Ids of plugins that actively mutated req/resp (see [`crate::plugins`]).
     pub plugins: Vec<String>,
     pub system: Option<String>,
@@ -118,7 +123,7 @@ mod tests {
     use super::*;
     #[test]
     fn router_event_complete_roundtrip() {
-        let json = r#"{"type":"complete","id":0,"ts_ms":1781573245225,"provider":"ollama","requested_model":"llama3.1:8b","sent_model":"llama3.1:8b","duration_ms":5978,"tags":[],"plugins":[],"system":null,"messages":[{"role":"user","content":"hi"}],"response":null,"error":null}"#;
+        let json = r#"{"type":"complete","id":0,"ts_ms":1781573245225,"provider":"ollama","requested_model":"llama3.1:8b","sent_model":"llama3.1:8b","duration_ms":5978,"tags":[],"plugins":[],"system":null,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"response":null,"error":null}"#;
         let event: RouterEvent = serde_json::from_str(json).expect("deser failed");
         match event {
             RouterEvent::Complete { id, entry } => {

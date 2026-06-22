@@ -10,6 +10,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     pub providers: Vec<ProviderConfig>,
     /// Routing rules, evaluated in order. The first rule that matches for a
     /// given request "wins" and decides the provider; a rule that doesn't
@@ -164,6 +166,33 @@ impl Default for LoggingConfig {
     }
 }
 
+/// OpenTelemetry export of traces, metrics, and logs over OTLP/HTTP. When
+/// disabled (the default), no exporters are constructed and the router
+/// behaves exactly as it would without this section present at all.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+    /// OTLP/HTTP endpoint, e.g. `"http://localhost:4318"`.
+    pub otlp_endpoint: String,
+    /// `service.name` resource attribute reported to the OTLP backend.
+    pub service_name: String,
+    /// Trace sampling ratio, 0.0-1.0. Applies to traces only — metrics and
+    /// logs are always exported in full when enabled.
+    pub sample_ratio: f64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        TelemetryConfig {
+            enabled: false,
+            otlp_endpoint: "http://localhost:4318".to_string(),
+            service_name: "opensourcellmrouter".to_string(),
+            sample_ratio: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -172,14 +201,23 @@ pub struct ServerConfig {
     /// Whether to serve the live request dashboard at `/dashboard` (and its
     /// `/dashboard/events` SSE feed).
     pub dashboard: bool,
+    /// Env var holding the key clients must present (as `Authorization:
+    /// Bearer <key>`, `x-api-key: <key>`, or `?api_key=<key>`) to reach any
+    /// route other than `/health`. Read once at startup — see
+    /// `server::AppState::api_key`. Omit to leave the server unauthenticated
+    /// (fine for `127.0.0.1`-only use; required reading if `host` is
+    /// `0.0.0.0` or otherwise reachable off-box).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
             port: 8090,
             dashboard: false,
+            api_key_env: None,
         }
     }
 }
@@ -203,12 +241,8 @@ pub struct ProviderConfig {
     /// Base URL, e.g. `http://localhost:8080/v1` or `https://api.openai.com/v1`.
     pub base_url: String,
     /// Name of an environment variable holding the API key, if required.
+    /// A provider whose key is unset is skipped entirely at startup.
     pub api_key_env: Option<String>,
-    /// If true, the provider is skipped at startup when `api_key_env` is unset.
-    /// If false (default), a warning is logged but the provider is kept — the
-    /// first request that hits it will fail instead of startup.
-    #[serde(default)]
-    pub strict: bool,
     /// Blended cost in USD per 1M tokens. Used by `price` and `fallback` routers.
     #[serde(default)]
     pub cost_per_1m_tokens: f64,

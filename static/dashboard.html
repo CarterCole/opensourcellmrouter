@@ -265,7 +265,9 @@ function renderStart(event) {
 }
 
 function connect() {
-  const es = new EventSource('/dashboard/events');
+  // Carries ?api_key=... through from the /dashboard URL, since
+  // EventSource can't set custom headers — see server::presented_key.
+  const es = new EventSource('/dashboard/events' + location.search);
 
   es.onopen = () => {
     statusEl.textContent = 'connected';

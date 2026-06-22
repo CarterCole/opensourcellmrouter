@@ -27,6 +27,13 @@ pub struct ModelRouter {
     /// [`Self::discover_models`]. Empty (and every [`RouterRule::Discover`]
     /// passes through) until that's been called.
     available_models: HashMap<String, HashSet<String>>,
+    /// Capabilities (e.g. `"vision"`, `"tools"`, `"coding"`) each discovered
+    /// model reports, keyed by model name alone — not provider+model, since
+    /// capability is a property of the model and a single Ollama provider
+    /// can host many models with different capabilities. Populated by
+    /// [`Self::discover_models`]. A model with no entry here is treated as
+    /// supporting everything (permissive default) — see [`Self::supports`].
+    model_capabilities: HashMap<String, HashSet<String>>,
 }
 
 impl ModelRouter {
@@ -34,23 +41,17 @@ impl ModelRouter {
         let mut providers = HashMap::new();
         let mut provider_configs = HashMap::new();
         for provider_config in &config.providers {
-            // Check API key env var if declared.
+            // Check API key env var if declared. A provider whose key is
+            // missing is skipped entirely so requests never get routed to it.
             if let Some(var) = &provider_config.api_key_env {
                 let missing = matches!(std::env::var(var), Ok(v) if v.is_empty())
                     || std::env::var(var).is_err();
                 if missing {
-                    if provider_config.strict {
-                        tracing::warn!(
-                            "skipping provider '{}': ${var} is not set (strict = true)",
-                            provider_config.name
-                        );
-                        continue;
-                    } else {
-                        tracing::warn!(
-                            "provider '{}': ${var} is not set — requests will fail until it is",
-                            provider_config.name
-                        );
-                    }
+                    tracing::warn!(
+                        "skipping provider '{}': ${var} is not set",
+                        provider_config.name
+                    );
+                    continue;
                 }
             }
             providers.insert(provider_config.name.clone(), Provider::from_config(provider_config));
@@ -66,19 +67,35 @@ impl ModelRouter {
             provider_configs,
             rules: config.routers.clone(),
             available_models: HashMap::new(),
+            model_capabilities: HashMap::new(),
         })
     }
 
     /// Queries every provider for the models it currently has available
     /// (see [`Provider::list_models`]) and caches the result for
-    /// [`RouterRule::Discover`] rules. Best-effort: a provider that's
-    /// unreachable is logged as a warning and left with no known models, so
-    /// `discover` rules for it simply pass through.
+    /// [`RouterRule::Discover`] rules. Also fetches each discovered model's
+    /// capabilities (see [`Provider::model_capabilities`]) for
+    /// [`Self::resolve`]'s capability filtering. Best-effort throughout: a
+    /// provider or model that's unreachable is logged as a warning and left
+    /// with no known models/capabilities, so `discover` rules pass through
+    /// and capability checks fall back to the permissive default.
     pub async fn discover_models(&mut self, client: &reqwest::Client) {
         for (name, provider) in &self.providers {
             match provider.list_models(client).await {
                 Ok(models) if !models.is_empty() => {
                     tracing::info!("provider '{name}' reports {} model(s): {models:?}", models.len());
+                    for model in &models {
+                        match provider.model_capabilities(client, model).await {
+                            Ok(caps) if !caps.is_empty() => {
+                                tracing::info!("model '{model}' on provider '{name}' reports capabilities: {caps:?}");
+                                self.model_capabilities.insert(model.clone(), caps.into_iter().collect());
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!("failed to fetch capabilities for model '{model}' on provider '{name}': {err:#}");
+                            }
+                        }
+                    }
                     self.available_models.insert(name.clone(), models.into_iter().collect());
                 }
                 Ok(_) => {}
@@ -86,6 +103,17 @@ impl ModelRouter {
                     tracing::warn!("failed to list models for provider '{name}': {err:#}");
                 }
             }
+        }
+    }
+
+    /// Whether `model` supports every capability in `needed`. A model with
+    /// no known capabilities (not Ollama, or not yet/never discovered) is
+    /// treated as supporting everything — capability filtering is opt-in by
+    /// virtue of being discoverable, not a default restriction.
+    fn supports(&self, model: &str, needed: &[String]) -> bool {
+        match self.model_capabilities.get(model) {
+            Some(caps) => needed.iter().all(|c| caps.contains(c)),
+            None => true,
         }
     }
 
@@ -98,10 +126,18 @@ impl ModelRouter {
     /// Resolve the requested model to a provider and the model name to send
     /// it (after any `rewrite_model`). `tags` are the classifier tags
     /// assigned to this request (see [`crate::classifiers`]), consulted by
-    /// [`RouterRule::Tag`] rules.
-    pub fn resolve(&self, model: &str, tags: &[String]) -> Option<(&Provider, String)> {
+    /// [`RouterRule::Tag`] rules. `needed` is what the request structurally
+    /// requires (see [`crate::canonical::ChatRequest::needed_capabilities`]);
+    /// a rule whose candidate model doesn't support everything in `needed`
+    /// is treated as a non-match and the chain continues to the next rule,
+    /// the same way `Price`/`Latency`/`Throughput` already skip candidates
+    /// that fail a numeric threshold.
+    pub fn resolve(&self, model: &str, tags: &[String], needed: &[String]) -> Option<(&Provider, String)> {
         for rule in &self.rules {
             if let Some((name, target_model)) = self.apply_rule(rule, model, tags) {
+                if !self.supports(&target_model, needed) {
+                    continue;
+                }
                 if let Some(provider) = self.providers.get(&name) {
                     return Some((provider, target_model));
                 }
@@ -305,19 +341,19 @@ mod tests {
 
         // A request tagged "vision" by a classifier is routed to the
         // vision-capable provider and rewritten, regardless of `model`.
-        let (provider, model) = router.resolve("gpt-4", &["vision".to_string()]).unwrap();
+        let (provider, model) = router.resolve("gpt-4", &["vision".to_string()], &[]).unwrap();
         assert_eq!(provider.name, "vision-provider");
         assert_eq!(model, "vision-model");
 
         // Likewise for "video".
-        let (provider, model) = router.resolve("gpt-4", &["video".to_string()]).unwrap();
+        let (provider, model) = router.resolve("gpt-4", &["video".to_string()], &[]).unwrap();
         assert_eq!(provider.name, "vision-provider");
         assert_eq!(model, "video-model");
 
         // No matching tag: the `tag` rules pass through to `fallback`,
         // which picks the highest-scoring provider (here, the
         // higher-quality "vision-provider") and leaves `model` untouched.
-        let (provider, model) = router.resolve("gpt-4", &[]).unwrap();
+        let (provider, model) = router.resolve("gpt-4", &[], &[]).unwrap();
         assert_eq!(provider.name, "vision-provider");
         assert_eq!(model, "gpt-4");
     }
@@ -351,7 +387,7 @@ mod tests {
         let mut router = ModelRouter::from_config(&config).unwrap();
 
         // Before discovery has run, "discover" passes through to fallback.
-        let (provider, _) = router.resolve("llama3:8b", &[]).unwrap();
+        let (provider, _) = router.resolve("llama3:8b", &[], &[]).unwrap();
         assert_eq!(provider.name, "openai");
 
         // Simulate discovery having found "llama3:8b" on the ollama provider.
@@ -359,12 +395,109 @@ mod tests {
             .available_models
             .insert("ollama".to_string(), ["llama3:8b".to_string()].into_iter().collect());
 
-        let (provider, model) = router.resolve("llama3:8b", &[]).unwrap();
+        let (provider, model) = router.resolve("llama3:8b", &[], &[]).unwrap();
         assert_eq!(provider.name, "ollama");
         assert_eq!(model, "llama3:8b");
 
         // A model ollama doesn't report having falls through to fallback.
-        let (provider, _) = router.resolve("gpt-4", &[]).unwrap();
+        let (provider, _) = router.resolve("gpt-4", &[], &[]).unwrap();
         assert_eq!(provider.name, "openai");
+    }
+
+    fn capability_test_config() -> Config {
+        toml::from_str(
+            r#"
+            [[providers]]
+            name = "ollama"
+            format = "ollama"
+            base_url = "http://localhost:11434"
+            cost_per_1m_tokens = 0.0
+            quality = 40
+
+            [[providers]]
+            name = "fallback-provider"
+            format = "openai"
+            base_url = "http://localhost:9090/v1"
+            cost_per_1m_tokens = 5.0
+            quality = 80
+
+            [[routers]]
+            type = "prefix"
+            model_prefix = "phi3"
+            provider = "ollama"
+
+            [[routers]]
+            type = "fallback"
+            rewrite_model = "gemma3:latest"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn capability_filter_skips_incapable_candidate_falls_through() {
+        let mut router = ModelRouter::from_config(&capability_test_config()).unwrap();
+        router
+            .model_capabilities
+            .insert("phi3:mini".to_string(), ["completion".to_string()].into_iter().collect());
+        router.model_capabilities.insert(
+            "gemma3:latest".to_string(),
+            ["completion".to_string(), "vision".to_string()].into_iter().collect(),
+        );
+
+        // phi3:mini doesn't support vision, so the prefix rule's pick is
+        // rejected; the chain falls through to fallback, whose
+        // rewrite_model points at the vision-capable gemma3:latest instead.
+        let (provider, model) = router.resolve("phi3:mini", &[], &["vision".to_string()]).unwrap();
+        assert_eq!(provider.name, "fallback-provider");
+        assert_eq!(model, "gemma3:latest");
+    }
+
+    #[test]
+    fn capability_filter_routes_directly_when_model_is_capable() {
+        let mut router = ModelRouter::from_config(&capability_test_config()).unwrap();
+        router.model_capabilities.insert(
+            "phi3:mini".to_string(),
+            ["completion".to_string(), "vision".to_string()].into_iter().collect(),
+        );
+
+        let (provider, model) = router.resolve("phi3:mini", &[], &["vision".to_string()]).unwrap();
+        assert_eq!(provider.name, "ollama");
+        assert_eq!(model, "phi3:mini");
+    }
+
+    #[test]
+    fn capability_filter_permissive_when_model_capabilities_unknown() {
+        let router = ModelRouter::from_config(&capability_test_config()).unwrap();
+
+        // No model_capabilities entry at all for phi3:mini: permissive
+        // default, routes directly even though "vision" is needed.
+        let (provider, model) = router.resolve("phi3:mini", &[], &["vision".to_string()]).unwrap();
+        assert_eq!(provider.name, "ollama");
+        assert_eq!(model, "phi3:mini");
+    }
+
+    #[test]
+    fn resolve_returns_none_when_no_candidate_is_capable() {
+        let config: Config = toml::from_str(
+            r#"
+            [[providers]]
+            name = "ollama"
+            format = "ollama"
+            base_url = "http://localhost:11434"
+
+            [[routers]]
+            type = "prefix"
+            model_prefix = "phi3"
+            provider = "ollama"
+            "#,
+        )
+        .unwrap();
+        let mut router = ModelRouter::from_config(&config).unwrap();
+        router
+            .model_capabilities
+            .insert("phi3:mini".to_string(), ["completion".to_string()].into_iter().collect());
+
+        assert!(router.resolve("phi3:mini", &[], &["vision".to_string()]).is_none());
     }
 }

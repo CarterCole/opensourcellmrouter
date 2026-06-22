@@ -58,3 +58,9 @@ and reflected in the TUI's pending-request list.
 
 `complete` events are the only ones written to the request log file. Disable
 the dashboard with `dashboard = false` under `[server]` in `config.toml`.
+
+## Telemetry
+
+Requests can optionally be traced end-to-end — plus counted and measured as
+metrics, and have their log lines bridged into OTel log records — via
+OpenTelemetry. See [telemetry.md](telemetry.md).

@@ -30,3 +30,11 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 bytes = "1.11.1"
 rand = "0.8"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics", "logs"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "http-proto", "reqwest-client", "trace", "metrics", "logs",
+] }
+tracing-opentelemetry = "0.33"
+opentelemetry-appender-tracing = "0.32"
+tower-http = { version = "0.6", features = ["trace"] }

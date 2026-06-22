@@ -1,18 +1,20 @@
 //! A configured upstream LLM backend, and the logic to call it.
 
 use anyhow::{bail, Context};
-use bytes::Bytes;
 use reqwest::Client;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::Instrument;
 
-use crate::canonical::{ChatRequest, ChatResponse};
+use crate::canonical::{ChatRequest, ChatResponse, StreamEvent};
 use crate::config::{ProviderConfig, ProviderFormat};
 use crate::formats::{anthropic, ollama, openai};
 
-/// A stream of SSE-formatted strings in OpenAI chunk format, suitable for
-/// proxying directly to the client as `text/event-stream`.
-pub type ChunkStream = ReceiverStream<anyhow::Result<Bytes>>;
+/// A stream of canonical [`StreamEvent`]s from an upstream provider,
+/// format-agnostic so the caller can render it into whichever wire format
+/// the client actually needs (OpenAI/Anthropic/Responses SSE) — see
+/// `server::dispatch_stream` and each format's `render_stream`.
+pub type ChunkStream = ReceiverStream<anyhow::Result<StreamEvent>>;
 
 pub struct Provider {
     pub name: String,
@@ -65,14 +67,18 @@ impl Provider {
         match self.format {
             ProviderFormat::OpenAi => self.stream_openai(client, req).await,
             ProviderFormat::Ollama => self.stream_ollama(client, req).await,
+            // Real upstream SSE streaming (content_block_delta events) isn't
+            // implemented for Anthropic-format providers — a request routed
+            // here with stream=true fails with this error rather than
+            // silently buffering. Out of scope for now; see docs/plan notes.
             ProviderFormat::Anthropic => bail!("streaming not supported for Anthropic format"),
         }
     }
 
-    /// Proxies the upstream's own `text/event-stream` response directly.
+    /// Parses the upstream's own OpenAI-shaped `text/event-stream` response
+    /// into canonical [`StreamEvent`]s via [`openai::OpenAiStreamDecoder`].
     async fn stream_openai(&self, client: &Client, req: &ChatRequest) -> anyhow::Result<ChunkStream> {
-        let mut body = openai::OpenAiChatRequest::from(req);
-        body.stream = true;
+        let body = openai::OpenAiChatRequest::from(req);
         let url = format!("{}/chat/completions", self.base_url);
 
         let mut rb = client.post(&url).json(&body);
@@ -80,7 +86,11 @@ impl Provider {
             rb = rb.bearer_auth(key);
         }
 
-        let resp = rb.send().await.with_context(|| format!("calling provider '{}'", self.name))?;
+        let resp = rb
+            .send()
+            .instrument(tracing::info_span!("provider.http", provider = %self.name, kind = "openai_stream"))
+            .await
+            .with_context(|| format!("calling provider '{}'", self.name))?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
@@ -89,11 +99,36 @@ impl Provider {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
-            let mut stream = resp.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(b) => { if tx.send(Ok(b)).await.is_err() { return; } }
+            let mut decoder = openai::OpenAiStreamDecoder::default();
+            let mut byte_stream = resp.bytes_stream();
+            let mut buf = String::new();
+
+            while let Some(chunk) = byte_stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
                     Err(e) => { tx.send(Err(anyhow::anyhow!(e))).await.ok(); return; }
+                };
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+
+                while let Some(nl) = buf.find('\n') {
+                    let line = buf[..nl].trim().to_owned();
+                    buf.drain(..=nl);
+                    let Some(data) = line.strip_prefix("data: ") else { continue };
+                    if data == "[DONE]" {
+                        return;
+                    }
+
+                    let chunk_resp: openai::OpenAiStreamChunk = match serde_json::from_str(data) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tx.send(Err(anyhow::anyhow!("parsing OpenAI stream chunk: {e}"))).await.ok();
+                            return;
+                        }
+                    };
+
+                    for event in decoder.decode(chunk_resp) {
+                        if tx.send(Ok(event)).await.is_err() { return; }
+                    }
                 }
             }
         });
@@ -101,10 +136,11 @@ impl Provider {
         Ok(ReceiverStream::new(rx))
     }
 
-    /// Translates Ollama's NDJSON streaming format into OpenAI SSE chunks.
+    /// Translates Ollama's NDJSON streaming format into canonical
+    /// [`StreamEvent`]s. Ollama doesn't stream tool-call deltas today, so
+    /// this only ever emits `TextDelta`/`Done`.
     async fn stream_ollama(&self, client: &Client, req: &ChatRequest) -> anyhow::Result<ChunkStream> {
-        let mut body = ollama::OllamaChatRequest::from(req);
-        body.stream = true;
+        let body = ollama::OllamaChatRequest::from(req);
         let url = format!("{}/api/chat", self.base_url);
 
         let mut rb = client.post(&url).json(&body);
@@ -112,7 +148,11 @@ impl Provider {
             rb = rb.bearer_auth(key);
         }
 
-        let resp = rb.send().await.with_context(|| format!("calling provider '{}'", self.name))?;
+        let resp = rb
+            .send()
+            .instrument(tracing::info_span!("provider.http", provider = %self.name, kind = "ollama_stream"))
+            .await
+            .with_context(|| format!("calling provider '{}'", self.name))?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await?;
@@ -120,12 +160,10 @@ impl Provider {
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let model_name = req.model.clone();
 
         tokio::spawn(async move {
             let mut byte_stream = resp.bytes_stream();
             let mut buf = String::new();
-            let mut chunk_id: u64 = 0;
 
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = match chunk {
@@ -147,30 +185,24 @@ impl Provider {
                         }
                     };
 
-                    chunk_id += 1;
-                    let done = chunk_resp.done;
-                    let sse = serde_json::json!({
-                        "id": format!("ollama-{model_name}-{chunk_id}"),
-                        "object": "chat.completion.chunk",
-                        "model": &model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": chunk_resp.message.content},
-                            "finish_reason": if done { serde_json::Value::String("stop".to_string()) } else { serde_json::Value::Null },
-                        }]
-                    });
+                    if !chunk_resp.message.content.is_empty() {
+                        let event = StreamEvent::TextDelta { text: chunk_resp.message.content };
+                        if tx.send(Ok(event)).await.is_err() { return; }
+                    }
 
-                    let line_out = format!("data: {sse}\n\n");
-                    if tx.send(Ok(Bytes::from(line_out))).await.is_err() { return; }
-
-                    if done {
-                        tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await.ok();
+                    if chunk_resp.done {
+                        let event = StreamEvent::Done {
+                            stop_reason: crate::canonical::StopReason::EndTurn,
+                            usage: crate::canonical::Usage {
+                                input_tokens: chunk_resp.prompt_eval_count,
+                                output_tokens: chunk_resp.eval_count,
+                            },
+                        };
+                        tx.send(Ok(event)).await.ok();
                         return;
                     }
                 }
             }
-
-            tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await.ok();
         });
 
         Ok(ReceiverStream::new(rx))
@@ -193,6 +225,7 @@ impl Provider {
 
         let resp = rb
             .send()
+            .instrument(tracing::info_span!("provider.http", provider = %self.name, kind = "list_models"))
             .await
             .with_context(|| format!("listing models for provider '{}'", self.name))?;
         let status = resp.status();
@@ -206,6 +239,42 @@ impl Provider {
         Ok(parsed.models.into_iter().map(|m| m.name).collect())
     }
 
+    /// Capabilities `model` reports via `POST /api/show` (e.g. `"vision"`,
+    /// `"tools"`), plus any inferred from its name/family that Ollama
+    /// doesn't explicitly tag (e.g. `"coding"`) — see
+    /// [`ollama::implicit_capabilities`]. Only `ollama`-format providers
+    /// support this; others return an empty list.
+    pub async fn model_capabilities(&self, client: &Client, model: &str) -> anyhow::Result<Vec<String>> {
+        if self.format != ProviderFormat::Ollama {
+            return Ok(Vec::new());
+        }
+
+        let url = format!("{}/api/show", self.base_url);
+        let body = ollama::OllamaShowRequest { model: model.to_string() };
+        let mut rb = client.post(&url).json(&body);
+        if let Some(key) = self.api_key()? {
+            rb = rb.bearer_auth(key);
+        }
+
+        let resp = rb
+            .send()
+            .instrument(tracing::info_span!("provider.http", provider = %self.name, kind = "model_capabilities"))
+            .await
+            .with_context(|| format!("fetching capabilities for model '{model}' on provider '{}'", self.name))?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            bail!("provider '{}' returned {} fetching capabilities for '{model}': {}", self.name, status, text);
+        }
+
+        let parsed: ollama::OllamaShowResponse = serde_json::from_str(&text)
+            .with_context(|| format!("parsing capabilities for model '{model}' from provider '{}': {}", self.name, text))?;
+
+        let mut capabilities = parsed.capabilities;
+        capabilities.extend(ollama::implicit_capabilities(model, &parsed.details.family));
+        Ok(capabilities)
+    }
+
     async fn send_openai(&self, client: &Client, req: &ChatRequest) -> anyhow::Result<ChatResponse> {
         let body = openai::OpenAiChatRequest::from(req);
         let url = format!("{}/chat/completions", self.base_url);
@@ -217,6 +286,7 @@ impl Provider {
 
         let resp = rb
             .send()
+            .instrument(tracing::info_span!("provider.http", provider = %self.name, kind = "openai_chat"))
             .await
             .with_context(|| format!("calling provider '{}'", self.name))?;
         let status = resp.status();
@@ -247,6 +317,7 @@ impl Provider {
 
         let resp = rb
             .send()
+            .instrument(tracing::info_span!("provider.http", provider = %self.name, kind = "anthropic_messages"))
             .await
             .with_context(|| format!("calling provider '{}'", self.name))?;
         let status = resp.status();
@@ -271,6 +342,7 @@ impl Provider {
 
         let resp = rb
             .send()
+            .instrument(tracing::info_span!("provider.http", provider = %self.name, kind = "ollama_chat"))
             .await
             .with_context(|| format!("calling provider '{}'", self.name))?;
         let status = resp.status();
@@ -312,6 +384,7 @@ mod tests {
             effort: None,
             task_budget,
             output_schema: None,
+            tools: Vec::new(),
             stream: false,
             plugins: Vec::new(),
             forced_provider: None,
@@ -328,5 +401,24 @@ mod tests {
     fn task_budget_requires_beta_header() {
         let req = request(Some(json!({"type": "tokens", "total": 64000})));
         assert_eq!(anthropic_beta_header(&req), Some("task-budgets-2026-03-13"));
+    }
+
+    #[test]
+    fn stream_flag_flows_into_every_outbound_format() {
+        let mut req = request(None);
+        req.stream = true;
+
+        assert!(openai::OpenAiChatRequest::from(&req).stream);
+        assert!(anthropic::AnthropicMessagesRequest::from(&req).stream);
+        assert!(ollama::OllamaChatRequest::from(&req).stream);
+    }
+
+    #[test]
+    fn stream_false_flows_into_every_outbound_format() {
+        let req = request(None);
+
+        assert!(!openai::OpenAiChatRequest::from(&req).stream);
+        assert!(!anthropic::AnthropicMessagesRequest::from(&req).stream);
+        assert!(!ollama::OllamaChatRequest::from(&req).stream);
     }
 }

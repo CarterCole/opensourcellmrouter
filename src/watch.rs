@@ -122,9 +122,9 @@ fn print_entry(e: &LogEntry) {
         .iter()
         .rev()
         .find(|m| m.role == Role::User)
-        .map(|m| m.content.as_str())
-        .unwrap_or("");
-    println!("  {DIM}prompt:{RESET}  {}", truncate(last_user, 120));
+        .map(|m| m.text_content())
+        .unwrap_or_default();
+    println!("  {DIM}prompt:{RESET}  {}", truncate(&last_user, 120));
 
     if let Some(err) = &e.error {
         println!("  {RED}error:{RESET}   {}", truncate(err, 120));

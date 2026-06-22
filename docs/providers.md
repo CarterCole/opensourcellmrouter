@@ -29,7 +29,10 @@ throughput_tokens_per_sec = 60
 
 Speaks the OpenAI chat completions API: `POST {base_url}/chat/completions`,
 bearer-auth via `api_key_env`. Also used for any OpenAI-compatible server
-(e.g. `llama-server`, vLLM, or Ollama's `/v1` compatibility endpoint).
+(e.g. `llama-server`, vLLM, or Ollama's `/v1` compatibility endpoint) and for
+OpenAI-compatible cloud APIs such as Cloudflare Workers AI or
+[xAI](https://docs.x.ai/) (`base_url = "https://api.x.ai/v1"`,
+`api_key_env = "XAI_API_KEY"`).
 
 ## `format = "anthropic"`
 

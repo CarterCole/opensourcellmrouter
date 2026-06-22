@@ -44,7 +44,7 @@ impl Classifier for KeywordClassifier {
         let mut haystack = req.system.clone().unwrap_or_default();
         for message in &req.messages {
             haystack.push(' ');
-            haystack.push_str(&message.content);
+            haystack.push_str(&message.text_content());
         }
         let haystack = haystack.to_lowercase();
 
@@ -69,23 +69,21 @@ impl Classifier for KeywordClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::{Message, Role};
+    use crate::canonical::{ContentPart, Message, Role};
     use serde_json::json;
 
     fn request(system: Option<&str>, content: &str) -> ChatRequest {
         ChatRequest {
             model: "test-model".to_string(),
             system: system.map(str::to_string),
-            messages: vec![Message {
-                role: Role::User,
-                content: content.to_string(),
-            }],
+            messages: vec![Message::text(Role::User, content)],
             max_tokens: None,
             temperature: None,
             thinking: None,
             effort: None,
             task_budget: None,
             output_schema: None,
+            tools: Vec::new(),
             stream: false,
             plugins: Vec::new(),
             forced_provider: None,
@@ -149,6 +147,26 @@ mod tests {
         };
 
         let req = request(None, "anything");
+        let tags = classifier.classify(&ctx, &req).await.unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ignores_image_and_tool_content() {
+        let classifier = KeywordClassifier;
+        let ctx = ClassifierContext {
+            settings: json!({"tags": {"vision": ["image"]}}).as_object().unwrap().clone(),
+        };
+
+        let mut req = request(None, "what's in this picture?");
+        req.messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentPart::Text { text: "describe this".to_string() },
+                ContentPart::Image { media_type: "image/png".to_string(), data: "abc-image-data".to_string() },
+            ],
+        }];
+
         let tags = classifier.classify(&ctx, &req).await.unwrap();
         assert!(tags.is_empty());
     }

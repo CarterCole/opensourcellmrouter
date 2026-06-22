@@ -588,6 +588,10 @@ fn entry_to_list_item(e: &LogEntry) -> ListItem<'static> {
             header.push(Span::raw("  "));
             header.push(Span::styled(format!("<{tag}>"), Style::default().fg(Color::Red)));
         }
+        header.push(Span::raw("  "));
+        header.push(Span::styled(format!("↑{}", resp.usage.input_tokens), Style::default().fg(Color::Green)));
+        header.push(Span::raw(" "));
+        header.push(Span::styled(format!("↓{}", resp.usage.output_tokens), Style::default().fg(Color::Magenta)));
     }
 
     let dur_color = if e.error.is_some() { Color::Red } else { Color::DarkGray };
@@ -601,7 +605,7 @@ fn entry_to_list_item(e: &LogEntry) -> ListItem<'static> {
         .iter()
         .rev()
         .find(|m| m.role == Role::User)
-        .map(|m| m.content.replace('\n', " "))
+        .map(|m| m.text_content().replace('\n', " "))
         .unwrap_or_default();
 
     let body = if let Some(err) = &e.error {

@@ -80,6 +80,7 @@ mod tests {
             model: "test-model".to_string(),
             content: content.to_string(),
             stop_reason: StopReason::EndTurn,
+            tool_calls: Vec::new(),
             usage: Usage::default(),
             tags: Vec::new(),
         }
@@ -96,6 +97,7 @@ mod tests {
             effort: None,
             task_budget: None,
             output_schema: None,
+            tools: Vec::new(),
             stream: false,
             plugins: Vec::new(),
             forced_provider: None,
