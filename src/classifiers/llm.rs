@@ -33,9 +33,13 @@
 //!
 //! Unlike `cev`'s, a pick has no probabilities (its `confidence` is
 //! always 1) and no decision of its own to correct through `/v1/feedback`.
-//! With `cev` enabled too, it labels cev's decision about the same request
-//! instead, which cev learns from (see [`super::cev`]). Every request costs
-//! a call to `provider`, and waits for it before being routed.
+//! Every request costs a call to `provider`, and waits for it before being
+//! routed.
+//!
+//! Enabling `cev` as well takes `mode = "teacher"`: both then run on every
+//! request, and each of llm's picks labels cev's decision about the same
+//! request, which cev learns from (see [`super::cev`]). Without it, the
+//! router refuses to start with both enabled.
 //!
 //! Settings:
 //!
@@ -48,6 +52,7 @@
 //! | `timeout_ms` | `5000` | How long to wait for an answer before routing without one. |
 //! | `max_chars` | `2000` | How much of the system prompt and of the message to send. |
 //! | `max_tokens` | `64` | Cap on the answer. Raise it for a model that thinks before answering. |
+//! | `mode` | `route` | `teacher` to run alongside the `cev` classifier and train it. |
 //!
 //! `models` are the same as `cev`'s: each has a `provider` and `model` to
 //! route to, an optional `description` of what the model is good at, and an
@@ -78,6 +83,19 @@ struct Settings {
     timeout_ms: u64,
     max_chars: usize,
     max_tokens: u32,
+    mode: Mode,
+}
+
+/// What the classifier does with its picks besides routing on them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Mode {
+    /// Just route on them.
+    #[default]
+    Route,
+    /// Also label the `cev` classifier's decisions with them, which cev
+    /// learns from.
+    Teacher,
 }
 
 impl Default for Settings {
@@ -90,6 +108,7 @@ impl Default for Settings {
             timeout_ms: 5000,
             max_chars: 2000,
             max_tokens: 64,
+            mode: Mode::default(),
         }
     }
 }
@@ -104,6 +123,7 @@ pub struct LlmClassifier {
     timeout: Duration,
     max_chars: usize,
     max_tokens: u32,
+    mode: Mode,
 }
 
 /// Whether `$var` is set to something, as [`crate::router::ModelRouter`]
@@ -165,7 +185,14 @@ impl LlmClassifier {
             timeout: Duration::from_millis(settings.timeout_ms),
             max_chars: settings.max_chars,
             max_tokens: settings.max_tokens,
+            mode: settings.mode,
         })
+    }
+
+    /// Whether this is a teacher: its picks label the `cev` classifier's
+    /// decisions (`mode = "teacher"`).
+    pub fn teaches(&self) -> bool {
+        self.mode == Mode::Teacher
     }
 
     /// The provider and model this classifier asks.
@@ -362,6 +389,17 @@ pub(crate) mod tests {
         LlmClassifier::from_settings(&settings, &providers(router_url, "")).unwrap()
     }
 
+    /// [`classifier`] in `mode = "teacher"`.
+    pub(crate) fn teacher(router_url: &str) -> LlmClassifier {
+        let settings = settings(json!({
+            "provider": "router",
+            "model": "router-model",
+            "mode": "teacher",
+            "models": two_models(),
+        }));
+        LlmClassifier::from_settings(&settings, &providers(router_url, "")).unwrap()
+    }
+
     fn request(system: Option<&str>, messages: Vec<Message>) -> ChatRequest {
         ChatRequest {
             model: "gpt-4".to_string(),
@@ -455,6 +493,24 @@ pub(crate) mod tests {
         req.messages.push(Message { role: Role::User, content: Vec::new() });
 
         assert_eq!(classifier.message(&req), "<request>\nFix the failing test\n</request>");
+    }
+
+    #[test]
+    fn teaches_only_in_teacher_mode() {
+        let build = |mode: Option<&str>| {
+            let mut value = json!({"provider": "router", "model": "m", "models": two_models()});
+            if let Some(mode) = mode {
+                value["mode"] = json!(mode);
+            }
+            LlmClassifier::from_settings(&settings(value), &providers("http://localhost:1/v1", ""))
+        };
+
+        assert!(!build(None).unwrap().teaches());
+        assert!(!build(Some("route")).unwrap().teaches());
+        assert!(build(Some("teacher")).unwrap().teaches());
+
+        let err = build(Some("student")).err().expect("mode should be rejected");
+        assert!(err.to_string().contains("unknown variant `student`"), "{err}");
     }
 
     #[test]

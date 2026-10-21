@@ -36,8 +36,10 @@ request, it just means that classifier's tags are missing.
 A classifier can also pick the model to route to outright, by returning a
 `route` (see [`cev`](#cev) and [`llm`](#llm)). Every pick is kept in
 `ChatRequest.routes`, and a [`cev`](routers.md#cev) or
-[`llm`](routers.md#llm) router rule acts on its own classifier's pick, so
-with both enabled the first of those rules in `routers` decides.
+[`llm`](routers.md#llm) router rule acts on its own classifier's pick. Both
+can only be enabled together with `mode = "teacher"` on `llm`
+([below](#learning-from-llm)); then the first of those rules in `routers`
+decides.
 
 `ChatRequest.tags` and `ChatRequest.routes` are not forwarded to providers,
 but are recorded in the request log (`tags` and `routes` fields) alongside
@@ -161,12 +163,26 @@ correct.
 
 #### Learning from `llm`
 
-With the [`llm` classifier](#llm) enabled too, both run on every request,
-and llm's pick becomes the label for cev's decision about the same
-request. cev learns from it as it would from a correction, so it trains on
-every request without anyone clicking anything, and once it predicts the
-LLM well it can take over the routing. Which classifier routes is up to
-`routers`:
+Running `cev` and [`llm`](#llm) together takes `mode = "teacher"` under
+`[classifiers.llm]`: llm is the teacher, cev the student. With both enabled
+and no mode, the router refuses to start, rather than guess which one to
+drop; so does `mode = "teacher"` without `cev` enabled, as it would teach
+nobody.
+
+```toml
+[classifiers.llm]
+enabled  = true
+provider = "anthropic"
+model    = "claude-haiku-5-5"
+mode     = "teacher"
+# ...and [[classifiers.llm.models]], plus [classifiers.cev] as above.
+```
+
+In teacher mode both run on every request, and llm's pick becomes the
+label for cev's decision about the same request. cev learns from it as it
+would from a correction, so it trains on every request without anyone
+clicking anything, and once it predicts the LLM well it can take over the
+routing. Which classifier routes is up to `routers`:
 
 ```toml
 # llm routes; cev only learns.
@@ -205,8 +221,9 @@ Filter on `metadata.source` to train on corrections alone. Every label a
 decision has is at `GET /v1/decisions/<id>` on the cev server.
 
 `llm_label_weight` sets how much an llm label counts against a correction's
-1; set it to `0` to have cev learn only from corrections. With `model`
-instead of `url`, the same decisions and labels are in the `db` file.
+1; set it to `0` to have cev learn only from corrections while both still
+run. With `model` instead of `url`, the same decisions and labels are in
+the `db` file.
 
 ### `llm`
 
@@ -249,6 +266,7 @@ an [`llm` rule](routers.md#llm).
 | `timeout_ms` | `5000` | How long to wait for an answer before routing without one. |
 | `max_chars` | `2000` | How much of the system prompt and of the message to send. |
 | `max_tokens` | `64` | Cap on the answer. Raise it for a model that thinks before answering (a `<think>…</think>` block is skipped). |
+| `mode` | `route` | `teacher` to run alongside the [`cev` classifier](#cev) and [train it](#learning-from-llm). Both enabled without it, or it without `cev`, is a startup error. |
 
 An option on a provider whose `api_key_env` isn't set is dropped with a
 warning, the same way the router skips that provider. If the answer
@@ -260,9 +278,10 @@ whichever model you pick — but every request waits for a full chat
 completion (and, for a cloud model, pays for one) before it's routed. A pick
 has no probabilities (`confidence` is always 1), and no decision id of its
 own, so on its own there are no `x-cev-*` headers and nothing to correct.
-Enable `cev` alongside it and each llm pick
+Enable `cev` alongside it, with `mode = "teacher"`, and each llm pick
 [labels cev's decision](#learning-from-llm) instead, which cev learns from
-while llm keeps routing; corrections then go to cev's decision.
+while llm keeps routing; corrections then go to cev's decision. Without
+the mode the router won't start with both enabled.
 
 Both classify each request on its own: the latest user message that has
 text (so an agent's tool-result turns are classified by what the user last

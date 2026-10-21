@@ -38,9 +38,10 @@
 //!
 //! cev decides every request whether or not a rule routes on its pick, so
 //! it can also learn while another classifier routes. With the `llm`
-//! classifier enabled too, each of its picks labels cev's decision about
-//! the same request (see [`CevClassifier::learn_from_llm`]), and a
-//! correction sent to `/v1/feedback` later takes that label's place.
+//! classifier enabled too, which takes `mode = "teacher"` on it, each of
+//! its picks labels cev's decision about the same request (see
+//! [`CevClassifier::learn_from_llm`]), and a correction sent to
+//! `/v1/feedback` later takes that label's place.
 //! Labels are stored with a `metadata.source` of `"feedback"` or `"llm"`,
 //! so a training set exported from cev can tell them apart.
 //!

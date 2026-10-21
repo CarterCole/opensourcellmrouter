@@ -16,9 +16,10 @@
 //! to outright (see [`cev`] and [`llm`]), for a
 //! [`crate::config::RouterRule::Cev`] or [`crate::config::RouterRule::Llm`]
 //! rule to act on; every pick is kept, and the first of those rules in the
-//! chain decides. With both enabled, `llm`'s pick also labels `cev`'s
-//! decision, so cev learns from every request whichever one routes it. A
-//! classifier that errors is logged and skipped; it never fails the request.
+//! chain decides. Running both takes `mode = "teacher"` on `llm`, which
+//! also makes its pick label `cev`'s decision, so cev learns from every
+//! request whichever one routes it. A classifier that errors is logged and
+//! skipped; it never fails the request.
 
 pub mod cev;
 pub mod keyword;
@@ -145,7 +146,8 @@ pub struct ClassifierRegistry {
     entries: Vec<ClassifierEntry>,
     /// The `cev` classifier, if enabled, for sending it feedback.
     cev: Option<Arc<cev::CevClassifier>>,
-    /// The `llm` classifier, if enabled, whose picks label cev's decisions.
+    /// The `llm` classifier, if enabled; if it's a teacher, its picks label
+    /// cev's decisions.
     llm: Option<Arc<llm::LlmClassifier>>,
 }
 
@@ -179,6 +181,19 @@ impl ClassifierRegistry {
         };
         if let Some(llm) = &llm {
             classifiers.push(llm.clone());
+        }
+
+        // Running both is a choice: llm teaches cev, or one of them goes.
+        match (&cev, &llm) {
+            (Some(_), Some(llm)) if !llm.teaches() => bail!(
+                "classifiers 'cev' and 'llm' are both enabled: set `mode = \"teacher\"` under \
+                 [classifiers.llm] to run both, with llm's picks training cev, or enable only one"
+            ),
+            (None, Some(llm)) if llm.teaches() => bail!(
+                "classifier 'llm' has `mode = \"teacher\"`, which trains the 'cev' classifier, \
+                 but that isn't enabled"
+            ),
+            _ => {}
         }
 
         check_routing(config, cev.as_deref(), llm.as_deref());
@@ -258,10 +273,10 @@ impl ClassifierRegistry {
     }
 
     /// Labels cev's decision about a request with llm's pick for it, if
-    /// both made one. The label is sent in the background: routing doesn't
-    /// wait for cev to learn from it.
+    /// llm is a teacher and both made a pick. The label is sent in the
+    /// background: routing doesn't wait for cev to learn from it.
     fn label_cev_with_llm(&self, routes: &[RouteChoice]) {
-        let (Some(cev), Some(llm)) = (&self.cev, &self.llm) else {
+        let (Some(cev), Some(llm)) = (&self.cev, self.llm.as_ref().filter(|llm| llm.teaches())) else {
             return;
         };
         let decision_id = routes.iter().find(|r| r.classifier == "cev").and_then(|r| r.decision_id.clone());
@@ -289,7 +304,7 @@ fn check_routing(config: &Config, cev: Option<&cev::CevClassifier>, llm: Option<
     let cev_rule = config.routers.iter().any(|r| matches!(r, RouterRule::Cev { .. }));
     let llm_rule = config.routers.iter().any(|r| matches!(r, RouterRule::Llm));
     // Whether llm's picks label cev's decisions.
-    let teaching = llm.is_some() && cev.is_some_and(|cev| cev.learns_from_llm());
+    let teaching = llm.is_some_and(|llm| llm.teaches()) && cev.is_some_and(|cev| cev.learns_from_llm());
 
     for (id, enabled, has_rule) in [("cev", cev.is_some(), cev_rule), ("llm", llm.is_some(), llm_rule)] {
         if !enabled && has_rule {
@@ -412,5 +427,91 @@ impl ResponseClassifierRegistry {
         }
 
         tags
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config with the `cev` classifier, and the `llm` one with `llm_mode`
+    /// (a line of its settings, or nothing), if each is enabled.
+    fn config(cev: bool, llm: Option<&str>) -> Config {
+        let cev = if cev {
+            r#"
+            [classifiers.cev]
+            enabled = true
+            url = "http://127.0.0.1:1"
+
+            [[classifiers.cev.models]]
+            provider = "ollama"
+            model = "a"
+
+            [[classifiers.cev.models]]
+            provider = "ollama"
+            model = "b"
+            "#
+        } else {
+            ""
+        };
+        let llm = match llm {
+            Some(mode) => format!(
+                r#"
+                [classifiers.llm]
+                enabled = true
+                provider = "ollama"
+                model = "m"
+                {mode}
+
+                [[classifiers.llm.models]]
+                provider = "ollama"
+                model = "a"
+
+                [[classifiers.llm.models]]
+                provider = "ollama"
+                model = "b"
+                "#
+            ),
+            None => String::new(),
+        };
+        toml::from_str(&format!(
+            r#"
+            [[providers]]
+            name = "ollama"
+            format = "ollama"
+            base_url = "http://localhost:11434"
+            {cev}
+            {llm}
+            "#
+        ))
+        .unwrap()
+    }
+
+    fn build(config: &Config) -> anyhow::Result<()> {
+        ClassifierRegistry::from_config(config).map(|_| ())
+    }
+
+    #[test]
+    fn either_routing_classifier_runs_alone() {
+        build(&config(true, None)).unwrap();
+        build(&config(false, Some(""))).unwrap();
+    }
+
+    #[test]
+    fn running_both_takes_teacher_mode() {
+        let err = build(&config(true, Some(""))).unwrap_err();
+        assert!(err.to_string().contains("set `mode = \"teacher\"`"), "{err}");
+
+        let err = build(&config(true, Some("mode = \"route\""))).unwrap_err();
+        assert!(err.to_string().contains("set `mode = \"teacher\"`"), "{err}");
+
+        let registry = ClassifierRegistry::from_config(&config(true, Some("mode = \"teacher\""))).unwrap();
+        assert!(registry.cev().is_some());
+    }
+
+    #[test]
+    fn teacher_mode_needs_cev_to_teach() {
+        let err = build(&config(false, Some("mode = \"teacher\""))).unwrap_err();
+        assert!(err.to_string().contains("isn't enabled"), "{err}");
     }
 }

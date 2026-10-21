@@ -778,7 +778,8 @@ async fn feedback(
 mod tests {
     use super::*;
     use crate::classifiers::cev::tests::{mock_classifier, mock_classifier_and_runtime};
-    use crate::classifiers::llm::tests::{classifier as llm_classifier, mock_provider};
+    use crate::classifiers::llm::LlmClassifier;
+    use crate::classifiers::llm::tests::{classifier as llm_classifier, mock_provider, teacher as llm_teacher};
     use crate::config::Config;
 
     fn header_value<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
@@ -971,10 +972,14 @@ mod tests {
         assert_eq!(error["error"]["type"], "router_error");
     }
 
-    #[tokio::test]
-    async fn llm_pick_routes_the_request_and_labels_cevs_decision() {
+    /// Serves a router with the mock `cev` classifier and an `llm` one built
+    /// by `llm` (from the URL of a provider that always answers "general"),
+    /// routing on `llm`'s pick. Returns its URL, cev's runtime and the
+    /// dashboard feed.
+    async fn serve_cev_and_llm(
+        llm: fn(&str) -> LlmClassifier,
+    ) -> (String, Arc<cev_runtime::Cev>, broadcast::Receiver<Arc<str>>) {
         let provider = echo_model_provider().await;
-        // The `llm` classifier asks a model that always says "general".
         let (asked, _) = mock_provider("general").await;
 
         let config: Config = toml::from_str(&format!(
@@ -994,20 +999,25 @@ mod tests {
         .unwrap();
 
         let (cev, runtime) = mock_classifier_and_runtime();
-        let (events, mut logged) = broadcast::channel(8);
+        let (events, logged) = broadcast::channel(8);
         let state = AppState {
             router: Arc::new(ModelRouter::from_config(&config).unwrap()),
             client: reqwest::Client::new(),
             logger: None,
             plugins: Arc::new(PluginRegistry::from_config(&config)),
-            classifiers: Arc::new(ClassifierRegistry::with_cev(cev, Some(llm_classifier(&asked)))),
+            classifiers: Arc::new(ClassifierRegistry::with_cev(cev, Some(llm(&asked)))),
             response_classifiers: Arc::new(ResponseClassifierRegistry::from_config(&config)),
             events,
             in_flight: Arc::new(AtomicU64::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),
             api_key: None,
         };
-        let router = serve(build_app(state, false)).await;
+        (serve(build_app(state, false)).await, runtime, logged)
+    }
+
+    #[tokio::test]
+    async fn a_teacher_llm_routes_the_request_and_labels_cevs_decision() {
+        let (router, runtime, mut logged) = serve_cev_and_llm(llm_teacher).await;
         let client = reqwest::Client::new();
 
         // cev would pick the coding model, but the `llm` rule routes on
@@ -1055,6 +1065,29 @@ mod tests {
         let learned: Value = resp.json().await.unwrap();
         assert_eq!(learned["learned"], true);
         assert_eq!(learned["task_examples"], 2);
+    }
+
+    #[tokio::test]
+    async fn an_llm_that_is_not_a_teacher_labels_nothing() {
+        let (router, runtime, mut logged) = serve_cev_and_llm(llm_classifier).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{router}/v1/chat/completions"))
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Help me with debugging these algorithms"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[X_ROUTER_MODEL], "llama3.1:8b");
+        let decision_id = resp.headers()[X_CEV_DECISION_ID].to_str().unwrap().to_string();
+        completed(&mut logged).await;
+
+        // Labels would have landed within this long, as in the test above.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(runtime.decision(&decision_id).unwrap().unwrap().1.is_empty());
     }
 
     #[tokio::test]
