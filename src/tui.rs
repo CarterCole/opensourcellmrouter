@@ -579,6 +579,13 @@ fn entry_to_list_item(e: &LogEntry) -> ListItem<'static> {
         header.push(Span::raw("  "));
         header.push(Span::styled(format!("[{tag}]"), Style::default().fg(Color::Yellow)));
     }
+    if let Some(route) = &e.route {
+        header.push(Span::raw("  "));
+        header.push(Span::styled(
+            format!("cev:{} {:.0}%", route.choice, route.probability() * 100.0),
+            Style::default().fg(Color::Green),
+        ));
+    }
     for plugin in &e.plugins {
         header.push(Span::raw("  "));
         header.push(Span::styled(format!("({plugin})"), Style::default().fg(Color::Magenta)));

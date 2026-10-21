@@ -60,6 +60,24 @@ provider = "openai"
 rewrite_model = "gpt-4o"
 ```
 
+### `cev`
+
+Routes to the model the [`cev` classifier](classifiers.md#cev) picked for
+this request (`ChatRequest.route`): both the provider and the model name
+come from the pick. Passes through if there is no pick — the classifier is
+disabled, unreachable or timed out — or if its confidence is below
+`min_confidence` (default `0`; confidence runs from 0, every model equally
+likely, to 1, certain).
+
+```toml
+[[routers]]
+type = "cev"
+min_confidence = 0.25
+```
+
+Rules before it in the chain win over the pick, so put explicit ones like
+`prefix` first; rules after it handle what cev was unsure of.
+
 ### `price`
 
 Picks the candidate provider with the lowest `cost_per_1m_tokens`. If

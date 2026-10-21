@@ -136,6 +136,14 @@ pub enum RouterRule {
         #[serde(default)]
         candidates: Vec<RandomCandidate>,
     },
+    /// Routes to the model the `cev` classifier picked for this request
+    /// (see [`crate::classifiers::cev`]). Passes through if it made no pick
+    /// — it's disabled, or failed — or its confidence (0 = no idea, 1 =
+    /// certain) is below `min_confidence`.
+    Cev {
+        #[serde(default)]
+        min_confidence: f64,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -309,6 +309,7 @@ mod tests {
             plugins: Vec::new(),
             forced_provider: None,
             tags: Vec::new(),
+            route: None,
         }
     }
 

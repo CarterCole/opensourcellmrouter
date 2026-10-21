@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::canonical::{ChatResponse, Message};
+use crate::canonical::{ChatResponse, Message, RouteChoice};
 
 /// Wire format for the SSE feed. Both the TUI and the browser dashboard
 /// parse this; the `type` field discriminates the variant.
@@ -74,6 +74,11 @@ pub struct LogEntry {
     /// search to find the matching trace.
     #[serde(default)]
     pub trace_id: Option<String>,
+    /// The model the `cev` classifier picked for this request, if it's
+    /// enabled (see [`crate::classifiers::cev`]) — whether or not a `cev`
+    /// router rule then acted on it.
+    #[serde(default)]
+    pub route: Option<RouteChoice>,
     /// Ids of plugins that actively mutated req/resp (see [`crate::plugins`]).
     pub plugins: Vec<String>,
     pub system: Option<String>,

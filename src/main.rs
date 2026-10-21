@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         .transpose()?;
 
     let plugin_registry = Arc::new(plugins::PluginRegistry::from_config(&config));
-    let classifier_registry = Arc::new(classifiers::ClassifierRegistry::from_config(&config));
+    let classifier_registry = Arc::new(classifiers::ClassifierRegistry::from_config(&config)?);
     let response_classifier_registry = Arc::new(classifiers::ResponseClassifierRegistry::from_config(&config));
 
     let (events, _) = tokio::sync::broadcast::channel(256);

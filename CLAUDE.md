@@ -12,6 +12,9 @@ cargo build
 cargo run
 cargo run -- path/to/config.toml
 
+# Run with the `cev` classifier's model in-process (see docs/classifiers.md)
+cargo run --release --features cev-local
+
 # Tests
 cargo test
 cargo test router::tests   # run a single test module
@@ -33,7 +36,7 @@ Start → classifiers → PreRouting → routers → provider → PostResponse �
 ```
 
 1. Plugin `on_start` hooks
-2. `classifiers` tag the request (e.g. `"vision"`, `"nsfw"`)
+2. `classifiers` tag the request (e.g. `"vision"`, `"nsfw"`), or pick its model outright (`cev`)
 3. Plugin `pre_request` hooks (can set `forced_provider` to bypass routing)
 4. `routers` chain picks a provider and optionally rewrites the model name
 5. Request forwarded to the chosen provider
@@ -46,13 +49,13 @@ A plugin hook returning `Flow::Stop` from `on_start`/`pre_request` skips routing
 
 ### Key modules
 
-- **`canonical.rs`** — internal `ChatRequest`/`ChatResponse` types that every wire format converts to/from. `ChatRequest.tags` is populated by classifiers; `ChatRequest.forced_provider` is set by plugins; `ChatResponse.tags` is populated by response classifiers. Neither `tags` field is mapped by the `formats/` `From` impls, so they reach clients only via the `X-Router-Request-Tags`/`X-Router-Response-Tags` headers (see `server::dispatch`).
+- **`canonical.rs`** — internal `ChatRequest`/`ChatResponse` types that every wire format converts to/from. `ChatRequest.tags` and `ChatRequest.route` are populated by classifiers; `ChatRequest.forced_provider` is set by plugins; `ChatResponse.tags` is populated by response classifiers. Neither `tags` field is mapped by the `formats/` `From` impls, so they reach clients only via the `X-Router-Request-Tags`/`X-Router-Response-Tags` headers (see `server::dispatch`).
 - **`config.rs`** — TOML config deserialized at startup. Defines `RouterRule` variants, `ProviderConfig`, `PluginEntryConfig`, etc.
 - **`router.rs`** — `ModelRouter` walks the ordered `routers` chain. At startup it calls `discover_models()` to populate `available_models` (used by the `discover` rule for Ollama).
-- **`server.rs`** — Axum routes, `AppState`, and the `dispatch()` function that orchestrates the full pipeline. Also serves the live dashboard.
+- **`server.rs`** — Axum routes, `AppState`, and the `dispatch()` function that orchestrates the full pipeline. Also serves the live dashboard and `POST /v1/feedback`.
 - **`formats/`** — Wire-format adapters: `openai.rs`, `anthropic.rs`, `ollama.rs`. Each implements `From`/`Into` for `ChatRequest`/`ChatResponse`.
 - **`plugins/mod.rs`** — `Plugin` trait and `PluginRegistry`. Plugins registered here in a fixed order; config enables/disables defaults; requests can opt in per-call via `"plugins": [{"id": "..."}]`.
-- **`classifiers/mod.rs`** — `Classifier` trait/`ClassifierRegistry` (pre-routing, request tags; `keyword.rs`) and `ResponseClassifier` trait/`ResponseClassifierRegistry` (post-response, response tags; `refusal.rs`).
+- **`classifiers/mod.rs`** — `Classifier` trait/`ClassifierRegistry` (pre-routing, request tags; `keyword.rs`) and `ResponseClassifier` trait/`ResponseClassifierRegistry` (post-response, response tags; `refusal.rs`). `cev.rs` asks a [cev](https://github.com/CarterCole/rust-cev) model which configured model should answer (`ChatRequest.route`) and takes corrections via `POST /v1/feedback`, keyed by the `x-cev-decision-id` response header.
 - **`provider.rs`** — `Provider` wraps a `ProviderConfig` and handles the actual HTTP call to the upstream, translating via `formats/`.
 
 ### Router rules (evaluated in order, first match wins)
@@ -61,6 +64,7 @@ A plugin hook returning `Flow::Stop` from `on_start`/`pre_request` skips routing
 |---|---|
 | `prefix` | `model` starts with `model_prefix` |
 | `tag` | a classifier tag matches |
+| `cev` | the `cev` classifier picked a model with at least `min_confidence` (routes to that provider + model) |
 | `price` | picks lowest-cost candidate (pass-through if none qualify) |
 | `latency` | picks lowest-latency candidate |
 | `throughput` | picks highest-throughput candidate |

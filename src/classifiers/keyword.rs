@@ -25,7 +25,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::{Classifier, ClassifierContext};
+use super::{Classification, Classifier, ClassifierContext};
 use crate::canonical::ChatRequest;
 
 pub struct KeywordClassifier;
@@ -36,9 +36,9 @@ impl Classifier for KeywordClassifier {
         "keyword"
     }
 
-    async fn classify(&self, ctx: &ClassifierContext, req: &ChatRequest) -> anyhow::Result<Vec<String>> {
+    async fn classify(&self, ctx: &ClassifierContext, req: &ChatRequest) -> anyhow::Result<Classification> {
         let Some(tags) = ctx.settings.get("tags").and_then(Value::as_object) else {
-            return Ok(Vec::new());
+            return Ok(Classification::default());
         };
 
         let mut haystack = req.system.clone().unwrap_or_default();
@@ -62,7 +62,7 @@ impl Classifier for KeywordClassifier {
             }
         }
 
-        Ok(matched)
+        Ok(matched.into())
     }
 }
 
@@ -88,6 +88,7 @@ mod tests {
             plugins: Vec::new(),
             forced_provider: None,
             tags: Vec::new(),
+            route: None,
         }
     }
 
@@ -102,7 +103,7 @@ mod tests {
         };
 
         let req = request(None, "Can you describe this Image for me?");
-        let tags = classifier.classify(&ctx, &req).await.unwrap();
+        let tags = classifier.classify(&ctx, &req).await.unwrap().tags;
         assert_eq!(tags, vec!["vision".to_string()]);
     }
 
@@ -120,7 +121,7 @@ mod tests {
         };
 
         let req = request(None, "Can you summarize this video clip for me?");
-        let tags = classifier.classify(&ctx, &req).await.unwrap();
+        let tags = classifier.classify(&ctx, &req).await.unwrap().tags;
         assert_eq!(tags, vec!["video".to_string()]);
     }
 
@@ -135,7 +136,7 @@ mod tests {
         };
 
         let req = request(None, "What's the weather like today?");
-        let tags = classifier.classify(&ctx, &req).await.unwrap();
+        let tags = classifier.classify(&ctx, &req).await.unwrap().tags;
         assert!(tags.is_empty());
     }
 
@@ -147,7 +148,7 @@ mod tests {
         };
 
         let req = request(None, "anything");
-        let tags = classifier.classify(&ctx, &req).await.unwrap();
+        let tags = classifier.classify(&ctx, &req).await.unwrap().tags;
         assert!(tags.is_empty());
     }
 
@@ -167,7 +168,7 @@ mod tests {
             ],
         }];
 
-        let tags = classifier.classify(&ctx, &req).await.unwrap();
+        let tags = classifier.classify(&ctx, &req).await.unwrap().tags;
         assert!(tags.is_empty());
     }
 }

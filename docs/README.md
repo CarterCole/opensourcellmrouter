@@ -14,7 +14,8 @@ Start → classifiers → PreRouting → routers → provider → PostResponse �
 1. **[Plugins](plugins.md)** `on_start` hooks run first, on the request as
    the client sent it — before classifiers see it.
 2. **[Classifiers](classifiers.md)** inspect the request and attach tags
-   (e.g. `"vision"`, `"nsfw"`) to `ChatRequest.tags`.
+   (e.g. `"vision"`, `"nsfw"`) to `ChatRequest.tags`. The `cev` classifier
+   instead picks the model to route to (`ChatRequest.route`).
 3. **Plugins** `pre_request` hooks run next, in config/request order. They
    can mutate the request (inject context, force a provider via
    `forced_provider`, etc).
@@ -58,6 +59,11 @@ and reflected in the TUI's pending-request list.
 
 `complete` events are the only ones written to the request log file. Disable
 the dashboard with `dashboard = false` under `[server]` in `config.toml`.
+
+When the [`cev` classifier](classifiers.md#cev) is enabled, each request
+also shows the models it chose between, with the probability it gave each.
+Clicking one sends it to `POST /v1/feedback` as the model that should have
+answered, which cev learns from.
 
 ## Telemetry
 

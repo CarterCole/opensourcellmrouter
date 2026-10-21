@@ -77,6 +77,30 @@
   .pill.tag { border-color: #3a4a6b; color: #9cc0ff; }
   .pill.plugin { border-color: #4a3a6b; color: #c39cff; }
   .pill.response-tag { border-color: #6b3a3a; color: #ff9c9c; }
+  .route {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    margin-top: 0.4rem;
+    font-size: 0.75rem;
+    color: var(--muted);
+  }
+  .route button {
+    font: inherit;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .route button:hover:enabled { border-color: var(--accent); color: var(--text); }
+  .route button:disabled { cursor: default; }
+  .route button.picked { border-color: var(--accent); color: var(--accent); }
+  .route button.labeled { border-color: #2d4a36; color: #6ee7a0; }
+  .route .failed { color: var(--error); }
   .body { margin-top: 0.4rem; display: grid; gap: 0.3rem; }
   .prompt, .response, .error-msg {
     font-size: 0.8rem;
@@ -143,6 +167,66 @@ function toggleExpand(e) {
   e.currentTarget.classList.toggle('expanded');
 }
 
+// The cev classifier's pick for a request: one button per model it chose
+// between, with the probability it gave each. Clicking a model reports it
+// as the one that should have answered, which cev learns from.
+function renderRoute(entry) {
+  const route = entry.route;
+  const row = document.createElement('div');
+  row.className = 'route';
+
+  const label = document.createElement('span');
+  label.className = 'label';
+  label.textContent = 'cev:';
+  row.appendChild(label);
+
+  const status = document.createElement('span');
+  const used = entry.provider === route.provider && entry.sent_model === route.model;
+  status.textContent = [
+    Math.round(route.confidence * 100) + '% confident',
+    route.adapted ? 'adapted' : '',
+    used ? '' : 'not used',
+    'click the right model',
+  ].filter(Boolean).join(' · ');
+
+  const buttons = [];
+  for (const [name, probability] of Object.entries(route.probabilities)) {
+    const button = document.createElement('button');
+    if (name === route.choice) button.className = 'picked';
+    button.textContent = name + ' ' + Math.round(probability * 100) + '%';
+    button.addEventListener('click', async () => {
+      for (const b of buttons) b.disabled = true;
+      status.className = '';
+      status.textContent = 'sending…';
+      try {
+        // ?api_key=... carries through, as for the event stream below.
+        const resp = await fetch('/v1/feedback' + location.search, {
+          method: 'POST',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({decision_id: route.decision_id, label: name}),
+        });
+        const body = await resp.json();
+        if (!resp.ok) throw new Error(body.error.message);
+        button.classList.add('labeled');
+        status.textContent = [
+          'labeled ' + name,
+          body.task_examples + ' label' + (body.task_examples === 1 ? '' : 's'),
+          body.adapter_active ? 'adapter active' : 'adapter not active yet',
+        ].join(' · ');
+      } catch (err) {
+        for (const b of buttons) b.disabled = false;
+        status.className = 'failed';
+        status.textContent = 'feedback failed: ' + err.message;
+      }
+    });
+    buttons.push(button);
+    row.appendChild(button);
+  }
+
+  row.appendChild(status);
+  return row;
+}
+
 function renderEntry(entry) {
   const el = document.createElement('div');
   el.className = 'entry' + (entry.error ? ' error' : '');
@@ -185,6 +269,7 @@ function renderEntry(entry) {
   row1.appendChild(duration);
 
   el.appendChild(row1);
+  if (entry.route) el.appendChild(renderRoute(entry));
 
   const body = document.createElement('div');
   body.className = 'body';

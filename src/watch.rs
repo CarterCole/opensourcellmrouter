@@ -17,6 +17,7 @@ const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const CYAN: &str = "\x1b[36m";
+const GREEN: &str = "\x1b[32m";
 const BLUE: &str = "\x1b[94m";
 const YELLOW: &str = "\x1b[33m";
 const MAGENTA: &str = "\x1b[35m";
@@ -102,6 +103,9 @@ fn print_entry(e: &LogEntry) {
 
     for tag in &e.tags {
         header.push_str(&format!("  {YELLOW}[{tag}]{RESET}"));
+    }
+    if let Some(route) = &e.route {
+        header.push_str(&format!("  {GREEN}cev:{} {:.0}%{RESET}", route.choice, route.probability() * 100.0));
     }
     for plugin in &e.plugins {
         header.push_str(&format!("  {MAGENTA}({plugin}){RESET}"));

@@ -6,6 +6,7 @@
 //! [`ChatResponse`] before being rendered in whichever format the caller
 //! used.
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +121,37 @@ pub struct ChatRequest {
     /// [`crate::config::RouterRule::Tag`]. Not forwarded to providers.
     #[serde(default, skip_serializing)]
     pub tags: Vec<String>,
+    /// The model a classifier picked for this request, if one did (see
+    /// [`crate::classifiers::cev`]). Consumed by
+    /// [`crate::config::RouterRule::Cev`]. Not forwarded to providers.
+    #[serde(default, skip_serializing)]
+    pub route: Option<RouteChoice>,
+}
+
+/// A classifier's pick of which model should answer a request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteChoice {
+    /// Id of the decision behind this pick. Send it to `POST /v1/feedback`
+    /// with the model that should have been picked to correct (or confirm)
+    /// it.
+    pub decision_id: String,
+    /// Name of the option that was picked.
+    pub choice: String,
+    pub provider: String,
+    pub model: String,
+    /// 0 = every option equally likely, 1 = certain.
+    pub confidence: f64,
+    /// Probability of each option, by name.
+    pub probabilities: IndexMap<String, f64>,
+    /// Whether what was learned from earlier feedback shaped this pick.
+    pub adapted: bool,
+}
+
+impl RouteChoice {
+    /// Probability of the option that was picked.
+    pub fn probability(&self) -> f64 {
+        self.probabilities.get(&self.choice).copied().unwrap_or_default()
+    }
 }
 
 impl ChatRequest {
@@ -342,6 +374,7 @@ mod tests {
             plugins: Vec::new(),
             forced_provider: None,
             tags: Vec::new(),
+            route: None,
         }
     }
 

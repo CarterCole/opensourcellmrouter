@@ -12,11 +12,25 @@ keywords = ["llm", "ai", "proxy", "router", "ollama"]
 categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
 exclude = [".env", "logs/", "config.toml", "CLAUDE.md"]
 
+[features]
+# Run the `cev` classifier's model in-process (`model = "..."` under
+# `[classifiers.cev]`) instead of talking to a `cev` server over HTTP. On
+# macOS this uses Metal and Accelerate (see the target-specific dependency
+# below).
+cev-local = ["cev-rs/local", "dep:cev-runtime", "dep:cev-model"]
+# Run the in-process model on an NVIDIA GPU.
+cuda = ["cev-local", "cev-model/cuda"]
+
 [dependencies]
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 axum = "0.8.9"
+cev-core = "0.1.0"
+cev-model = { version = "0.1.0", optional = true }
+cev-rs = "0.1.0"
+cev-runtime = { version = "0.1.0", optional = true }
 futures-core = "0.3.32"
+indexmap = { version = "2", features = ["serde"] }
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
 ratatui = "0.29"
 crossterm = "0.28"
@@ -38,3 +52,11 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 tracing-opentelemetry = "0.33"
 opentelemetry-appender-tracing = "0.32"
 tower-http = { version = "0.6", features = ["trace"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cev-model = { version = "0.1.0", optional = true, features = ["metal", "accelerate"] }
+
+[dev-dependencies]
+# Tests run the `cev` classifier against cev's mock backend, in-process.
+cev-rs = { version = "0.1.0", features = ["local"] }
+cev-runtime = "0.1.0"

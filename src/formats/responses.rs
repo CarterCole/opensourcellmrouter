@@ -160,6 +160,7 @@ impl From<ResponsesRequest> for ChatRequest {
             plugins: req.plugins,
             forced_provider: None,
             tags: Vec::new(),
+            route: None,
         }
     }
 }

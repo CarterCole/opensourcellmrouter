@@ -1,6 +1,7 @@
 //! HTTP surface: an OpenAI-compatible `/v1/chat/completions` endpoint and an
 //! Anthropic-compatible `/v1/messages` endpoint, both backed by the same
-//! [`ModelRouter`].
+//! [`ModelRouter`], plus `/v1/feedback` for correcting the `cev`
+//! classifier's routing picks.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -16,13 +17,14 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use futures_core::Stream;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::Instrument;
 
-use crate::canonical::{ChatRequest, ChatResponse, Usage};
+use crate::canonical::{ChatRequest, ChatResponse, RouteChoice, Usage};
 use crate::classifiers::{ClassifierRegistry, ResponseClassifierRegistry};
 use crate::formats::{anthropic, openai, responses};
 use crate::logging::{LogEntry, RequestLogger, RouterEvent};
@@ -58,7 +60,8 @@ pub fn build_app(state: AppState, dashboard: bool) -> AxumRouter {
     let mut protected = AxumRouter::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
-        .route("/v1/responses", post(responses_endpoint));
+        .route("/v1/responses", post(responses_endpoint))
+        .route("/v1/feedback", post(feedback));
 
     if dashboard {
         protected = protected
@@ -134,6 +137,8 @@ enum ApiError {
     Plugin(&'static str, anyhow::Error),
     NoResponse,
     Unauthorized,
+    /// Feedback for the `cev` classifier couldn't be recorded.
+    Feedback(StatusCode, String),
 }
 
 impl IntoResponse for ApiError {
@@ -156,6 +161,7 @@ impl IntoResponse for ApiError {
                 StatusCode::UNAUTHORIZED,
                 "missing or invalid API key".to_string(),
             ),
+            ApiError::Feedback(status, message) => (status, message),
         };
 
         (
@@ -298,6 +304,9 @@ struct DispatchOutcome {
     provider: String,
     /// Model name actually sent to that provider (after any `rewrite_model`).
     model: String,
+    /// The model a classifier picked for the request, if one did (see
+    /// [`crate::classifiers::cev`]).
+    route: Option<RouteChoice>,
 }
 
 /// Runs the full pipeline for one request:
@@ -339,7 +348,9 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
     let mut provider_name = "plugin".to_string();
 
     if run_stage(&resolved_plugins, &state.client, Stage::Start, &mut req, &mut resp, &mut active_plugins).await? == Flow::Continue {
-        req.tags = state.classifiers.classify(&req).await;
+        let classification = state.classifiers.classify(&req).await;
+        req.tags = classification.tags;
+        req.route = classification.route;
         tracing::Span::current().record("tags", format!("{:?}", req.tags));
         broadcast(state, &RouterEvent::Classified {
             id,
@@ -361,7 +372,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
                 }
                 None => state
                     .router
-                    .resolve(&req.model, &req.tags, &req.needed_capabilities())
+                    .resolve(&req.model, &req.tags, req.route.as_ref(), &req.needed_capabilities())
                     .ok_or_else(|| ApiError::NoProvider(req.model.clone()))?,
             };
 
@@ -392,6 +403,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
                             sent_model,
                             duration_ms: duration.as_millis() as u64,
                             tags: req.tags,
+                            route: req.route,
                             plugins: active_plugins,
                             system: req.system,
                             messages: req.messages,
@@ -417,6 +429,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
     }
 
     let request_tags = req.tags.clone();
+    let route = req.route.clone();
     let provider = provider_name.clone();
     let model = sent_model.clone();
     let duration = started.elapsed();
@@ -430,6 +443,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
             sent_model,
             duration_ms: duration.as_millis() as u64,
             tags: req.tags,
+            route: req.route,
             plugins: active_plugins,
             system: req.system,
             messages: req.messages,
@@ -444,6 +458,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
         request_tags,
         provider,
         model,
+        route,
     })
 }
 
@@ -503,6 +518,22 @@ fn apply_router_headers(
     apply_header(response, X_ROUTER_OUTPUT_TOKENS, &usage.output_tokens.to_string());
 }
 
+/// Response header naming the `cev` classifier's decision for a request
+/// (`RouteChoice::decision_id`), so the client can correct it later via
+/// `POST /v1/feedback`.
+const X_CEV_DECISION_ID: &str = "x-cev-decision-id";
+/// Name of the option the `cev` classifier picked (`RouteChoice::choice`).
+const X_CEV_CHOICE: &str = "x-cev-choice";
+
+/// Sets [`X_CEV_DECISION_ID`] and [`X_CEV_CHOICE`] when a classifier picked
+/// the model for this request; omitted otherwise.
+fn apply_route_headers(response: &mut Response, route: Option<&RouteChoice>) {
+    if let Some(route) = route {
+        apply_header(response, X_CEV_DECISION_ID, &route.decision_id);
+        apply_header(response, X_CEV_CHOICE, &route.choice);
+    }
+}
+
 /// Which wire format the client that hit a streaming endpoint expects its
 /// SSE response rendered in. Deliberately distinct from
 /// [`crate::config::ProviderFormat`] — that describes the *upstream*, and
@@ -530,6 +561,7 @@ async fn chat_completions(
                 let usage = outcome.response.usage.clone();
                 let mut response = Json(openai::OpenAiChatResponse::from(outcome.response)).into_response();
                 apply_router_headers(&mut response, &outcome.request_tags, &response_tags, &outcome.provider, &outcome.model, &usage);
+                apply_route_headers(&mut response, outcome.route.as_ref());
                 response
             }
             Err(e) => e.into_response(),
@@ -563,7 +595,9 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
     });
 
     // Classify + route without running plugins.
-    req.tags = state.classifiers.classify(&req).await;
+    let classification = state.classifiers.classify(&req).await;
+    req.tags = classification.tags;
+    req.route = classification.route;
     tracing::Span::current().record("tags", format!("{:?}", req.tags));
     broadcast(&state, &RouterEvent::Classified {
         id,
@@ -571,7 +605,7 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
         tags: req.tags.clone(),
     });
 
-    let (provider, target_model) = match state.router.resolve(&req.model, &req.tags, &req.needed_capabilities()) {
+    let (provider, target_model) = match state.router.resolve(&req.model, &req.tags, req.route.as_ref(), &req.needed_capabilities()) {
         Some(p) => p,
         None => {
             state.in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -582,6 +616,7 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
     let provider_name = provider.name.clone();
     let sent_model = target_model.clone();
     let tags = req.tags.clone();
+    let route = req.route.clone();
     tracing::Span::current().record("provider", &provider_name);
     tracing::Span::current().record("model", &sent_model);
     broadcast(&state, &RouterEvent::Routed {
@@ -637,6 +672,7 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
                     sent_model,
                     duration_ms: duration.as_millis() as u64,
                     tags,
+                    route: req.route,
                     plugins: Vec::new(),
                     system: req.system,
                     messages: req.messages,
@@ -650,12 +686,14 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
     );
 
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
-    Response::builder()
+    let mut response = Response::builder()
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
         .body(body)
-        .unwrap()
+        .unwrap();
+    apply_route_headers(&mut response, route.as_ref());
+    response
 }
 
 async fn messages(
@@ -672,6 +710,7 @@ async fn messages(
                 let usage = outcome.response.usage.clone();
                 let mut response = Json(anthropic::AnthropicMessagesResponse::from(outcome.response)).into_response();
                 apply_router_headers(&mut response, &outcome.request_tags, &response_tags, &outcome.provider, &outcome.model, &usage);
+                apply_route_headers(&mut response, outcome.route.as_ref());
                 response
             }
             Err(e) => e.into_response(),
@@ -693,6 +732,7 @@ async fn responses_endpoint(
                 let usage = outcome.response.usage.clone();
                 let mut response = Json(responses::ResponsesResponse::from(outcome.response)).into_response();
                 apply_router_headers(&mut response, &outcome.request_tags, &response_tags, &outcome.provider, &outcome.model, &usage);
+                apply_route_headers(&mut response, outcome.route.as_ref());
                 response
             }
             Err(e) => e.into_response(),
@@ -700,9 +740,42 @@ async fn responses_endpoint(
     }
 }
 
+#[derive(Deserialize)]
+struct FeedbackRequest {
+    /// The `x-cev-decision-id` of the request being corrected.
+    decision_id: String,
+    /// Name of the model that should have been picked for it.
+    label: String,
+    comment: Option<String>,
+}
+
+/// Tells the `cev` classifier which model it should have picked for an
+/// earlier request, which it learns from (see
+/// [`crate::classifiers::cev::CevClassifier::feedback`]).
+async fn feedback(
+    State(state): State<AppState>,
+    Json(body): Json<FeedbackRequest>,
+) -> Result<Json<cev::FeedbackResponse>, ApiError> {
+    let classifier = state
+        .classifiers
+        .cev()
+        .ok_or_else(|| ApiError::Feedback(StatusCode::NOT_FOUND, "the 'cev' classifier is not enabled".to_string()))?;
+
+    match classifier.feedback(&body.decision_id, &body.label, body.comment).await {
+        Ok(learned) => Ok(Json(learned)),
+        Err(cev::Error::Api { status, message }) => Err(ApiError::Feedback(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            message,
+        )),
+        Err(err) => Err(ApiError::Feedback(StatusCode::BAD_GATEWAY, err.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classifiers::cev::tests::mock_classifier;
+    use crate::config::Config;
 
     fn header_value<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
         response.headers().get(name).and_then(|v| v.to_str().ok())
@@ -774,5 +847,113 @@ mod tests {
     fn presented_key_prefers_header_over_query() {
         let headers = headers_with("x-api-key", "from-header");
         assert_eq!(presented_key(&headers, "api_key=from-query"), Some("from-header".to_string()));
+    }
+
+    /// Serves `app` on a free local port and returns its base URL.
+    async fn serve(app: AxumRouter) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    #[tokio::test]
+    async fn cev_pick_routes_the_request_and_takes_feedback() {
+        // A provider that answers with the name of the model it was asked for.
+        let provider = serve(AxumRouter::new().route(
+            "/v1/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                Json(json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "model": body["model"],
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": body["model"]},
+                        "finish_reason": "stop",
+                    }],
+                }))
+            }),
+        ))
+        .await;
+
+        let config: Config = toml::from_str(&format!(
+            r#"
+            [[providers]]
+            name = "ollama"
+            format = "openai"
+            base_url = "{provider}/v1"
+
+            [[routers]]
+            type = "cev"
+
+            [[routers]]
+            type = "fallback"
+            "#
+        ))
+        .unwrap();
+
+        let (events, mut logged) = broadcast::channel(8);
+        let state = AppState {
+            router: Arc::new(ModelRouter::from_config(&config).unwrap()),
+            client: reqwest::Client::new(),
+            logger: None,
+            plugins: Arc::new(PluginRegistry::from_config(&config)),
+            classifiers: Arc::new(ClassifierRegistry::with_cev(mock_classifier())),
+            response_classifiers: Arc::new(ResponseClassifierRegistry::from_config(&config)),
+            events,
+            in_flight: Arc::new(AtomicU64::new(0)),
+            next_id: Arc::new(AtomicU64::new(0)),
+            api_key: None,
+        };
+        let router = serve(build_app(state, false)).await;
+        let client = reqwest::Client::new();
+
+        // The request goes to the model cev picked, not the "gpt-4" it named,
+        // and the response says which decision that was.
+        let resp = client
+            .post(format!("{router}/v1/chat/completions"))
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Help me with debugging these algorithms"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-cev-choice"], "deepseek-r1:latest");
+        let decision_id = resp.headers()["x-cev-decision-id"].to_str().unwrap().to_string();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "deepseek-r1:latest");
+
+        // The same decision is in the request log, for the dashboard.
+        let entry = loop {
+            let event: Value = serde_json::from_str(&logged.recv().await.unwrap()).unwrap();
+            if event["type"] == "complete" {
+                break event;
+            }
+        };
+        assert_eq!(entry["sent_model"], "deepseek-r1:latest");
+        assert_eq!(entry["route"]["decision_id"], decision_id.as_str());
+        assert_eq!(entry["route"]["choice"], "deepseek-r1:latest");
+
+        // Correcting it by decision id reaches cev, which learns from it.
+        let correct = |label: &'static str| {
+            client
+                .post(format!("{router}/v1/feedback"))
+                .json(&json!({"decision_id": decision_id, "label": label}))
+                .send()
+        };
+        let resp = correct("general").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let learned: Value = resp.json().await.unwrap();
+        assert_eq!(learned["learned"], true);
+        assert_eq!(learned["task_examples"], 1);
+
+        // A label that isn't one of the models is the caller's mistake.
+        let resp = correct("gpt-4").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let error: Value = resp.json().await.unwrap();
+        assert_eq!(error["error"]["type"], "router_error");
     }
 }
