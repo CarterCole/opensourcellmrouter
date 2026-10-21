@@ -1045,4 +1045,397 @@ mod tests {
         assert_eq!(entry["route"]["classifier"], "llm");
         assert_eq!(entry["route"]["choice"], "general");
     }
+
+    /// An upstream Anthropic streaming reply that says something, then calls
+    /// a tool — shaped like the real API's, `ping` and a thinking block
+    /// (which the router drops) included.
+    const ANTHROPIC_TOOL_USE_SSE: &str = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"msg_up","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}"#, "\n\n",
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#, "\n\n",
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Need the weather tool."}}"#, "\n\n",
+        "event: content_block_stop\n",
+        r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#, "\n\n",
+        "event: ping\n",
+        r#"data: {"type": "ping"}"#, "\n\n",
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hel"}}"#, "\n\n",
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"lo ☀"}}"#, "\n\n",
+        "event: content_block_stop\n",
+        r#"data: {"type":"content_block_stop","index":1}"#, "\n\n",
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#, "\n\n",
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\": "}}"#, "\n\n",
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"Paris\"}"}}"#, "\n\n",
+        "event: content_block_stop\n",
+        r#"data: {"type":"content_block_stop","index":2}"#, "\n\n",
+        "event: message_delta\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":42}}"#, "\n\n",
+        "event: message_stop\n",
+        r#"data: {"type":"message_stop"}"#, "\n\n",
+    );
+
+    /// An upstream Anthropic streaming reply that starts normally, then fails
+    /// with an `error` event — the API's way of reporting e.g. overload after
+    /// it has already answered `200`.
+    const ANTHROPIC_ERROR_SSE: &str = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"msg_up","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","usage":{"input_tokens":25,"output_tokens":1}}}"#, "\n\n",
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#, "\n\n",
+        "event: error\n",
+        r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#, "\n\n",
+    );
+
+    /// Env var the test provider's `api_key_env` names; see
+    /// [`spawn_router_to_anthropic`].
+    const TEST_ANTHROPIC_KEY_ENV: &str = "OSLR_TEST_ANTHROPIC_STREAM_KEY";
+
+    /// Headers and JSON body of every request a mock upstream received.
+    type Captured = Arc<std::sync::Mutex<Vec<(HeaderMap, Value)>>>;
+
+    /// Binds `app` to a random localhost port and serves it in the background.
+    async fn serve_on_random_port(app: AxumRouter) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// A stand-in for the Anthropic API that answers every `POST
+    /// /v1/messages` with `sse`, in small chunks so lines (and the multi-byte
+    /// `☀`) can straddle reads.
+    async fn spawn_mock_anthropic(sse: &'static str) -> (std::net::SocketAddr, Captured) {
+        let captured = Captured::default();
+        let captured_by_handler = captured.clone();
+        let app = AxumRouter::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_by_handler.clone();
+                async move {
+                    captured.lock().unwrap().push((headers, body));
+                    let chunks: Vec<Result<bytes::Bytes, Infallible>> =
+                        sse.as_bytes().chunks(16).map(|c| Ok(bytes::Bytes::copy_from_slice(c))).collect();
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(tokio_stream::iter(chunks)))
+                        .unwrap()
+                }
+            }),
+        );
+        (serve_on_random_port(app).await, captured)
+    }
+
+    /// Starts the full router app with a single `format = "anthropic"`
+    /// provider pointed at `upstream`, behind a fallback rule.
+    async fn spawn_router_to_anthropic(upstream: std::net::SocketAddr) -> std::net::SocketAddr {
+        // SAFETY: edition 2024 makes `set_var` unsafe because another thread
+        // could read the environment mid-write. Only these tests touch this
+        // variable, always writing the same value, and std serializes its
+        // own `env::var`/`set_var` calls against each other.
+        unsafe { std::env::set_var(TEST_ANTHROPIC_KEY_ENV, "test-key") };
+
+        let config: crate::config::Config = toml::from_str(&format!(
+            r#"
+            [[providers]]
+            name = "claude"
+            format = "anthropic"
+            base_url = "http://{upstream}/v1"
+            api_key_env = "{TEST_ANTHROPIC_KEY_ENV}"
+
+            [[routers]]
+            type = "fallback"
+            "#
+        ))
+        .unwrap();
+
+        let (events, _) = broadcast::channel(16);
+        let state = AppState {
+            router: Arc::new(ModelRouter::from_config(&config).unwrap()),
+            client: reqwest::Client::new(),
+            logger: None,
+            plugins: Arc::new(PluginRegistry::from_config(&config)),
+            classifiers: Arc::new(ClassifierRegistry::from_config(&config).unwrap()),
+            response_classifiers: Arc::new(ResponseClassifierRegistry::from_config(&config)),
+            events,
+            in_flight: Arc::new(AtomicU64::new(0)),
+            next_id: Arc::new(AtomicU64::new(0)),
+            api_key: None,
+        };
+        serve_on_random_port(build_app(state, false)).await
+    }
+
+    /// Splits an Anthropic-style SSE body into `(event_name, data_json)`
+    /// pairs, one per `event: ...\ndata: ...\n\n` block.
+    fn parse_named_sse(body: &str) -> Vec<(String, Value)> {
+        body.split("\n\n")
+            .filter(|block| !block.is_empty())
+            .map(|block| {
+                let mut lines = block.lines();
+                let event_name = lines.next().unwrap().trim_start_matches("event: ").to_string();
+                let data = lines.next().unwrap().trim_start_matches("data: ");
+                (event_name, serde_json::from_str(data).unwrap())
+            })
+            .collect()
+    }
+
+    /// Every `data:` payload of an OpenAI-style SSE body, as raw strings
+    /// (so the closing `[DONE]` sentinel is kept).
+    fn parse_data_sse(body: &str) -> Vec<String> {
+        body.lines().filter_map(|l| l.strip_prefix("data: ")).map(str::to_string).collect()
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_streams_end_to_end_to_every_client_format() {
+        let (upstream, captured) = spawn_mock_anthropic(ANTHROPIC_TOOL_USE_SSE).await;
+        let router = spawn_router_to_anthropic(upstream).await;
+        let client = reqwest::Client::new();
+
+        // An Anthropic client (e.g. Claude Code) on /v1/messages. The task
+        // budget is only here to check the beta header reaches the upstream.
+        let resp = client
+            .post(format!("http://{router}/v1/messages"))
+            .json(&json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "stream": true,
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+                "output_config": {"task_budget": {"type": "tokens", "total": 64000}},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
+        let events = parse_named_sse(&resp.text().await.unwrap());
+
+        let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[1].1["content_block"]["type"], "text");
+        assert_eq!(events[2].1["delta"]["text"], "Hel");
+        assert_eq!(events[3].1["delta"]["text"], "lo ☀");
+        assert_eq!(events[5].1["content_block"], json!({"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}));
+        let partial_json: String = events[6..8].iter().map(|(_, e)| e["delta"]["partial_json"].as_str().unwrap()).collect();
+        assert_eq!(partial_json, r#"{"city": "Paris"}"#);
+        assert_eq!(events[9].1["delta"]["stop_reason"], "tool_use");
+        assert_eq!(events[9].1["usage"], json!({"input_tokens": 25, "output_tokens": 42}));
+
+        // An OpenAI client (e.g. Copilot CLI) on /v1/chat/completions, routed
+        // to the same Anthropic upstream.
+        let resp = client
+            .post(format!("http://{router}/v1/chat/completions"))
+            .json(&json!({
+                "model": "claude-opus-4-8",
+                "stream": true,
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let data = parse_data_sse(&resp.text().await.unwrap());
+
+        assert_eq!(data.last().map(String::as_str), Some("[DONE]"));
+        let chunks: Vec<Value> = data[..data.len() - 1].iter().map(|d| serde_json::from_str(d).unwrap()).collect();
+        let text: String = chunks.iter().filter_map(|c| c["choices"][0]["delta"]["content"].as_str()).collect();
+        assert_eq!(text, "Hello ☀");
+        let tool_deltas: Vec<&Value> = chunks.iter().filter_map(|c| c["choices"][0]["delta"]["tool_calls"].get(0)).collect();
+        assert_eq!(tool_deltas[0]["id"], "toolu_1");
+        assert_eq!(tool_deltas[0]["function"]["name"], "get_weather");
+        let arguments: String = tool_deltas.iter().map(|t| t["function"]["arguments"].as_str().unwrap()).collect();
+        assert_eq!(arguments, r#"{"city": "Paris"}"#);
+        assert_eq!(chunks.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
+
+        // A Responses API client (e.g. Codex) on /v1/responses.
+        let resp = client
+            .post(format!("http://{router}/v1/responses"))
+            .json(&json!({
+                "model": "claude-opus-4-8",
+                "stream": true,
+                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Weather in Paris?"}]}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let events = parse_named_sse(&resp.text().await.unwrap());
+
+        let text: String = events
+            .iter()
+            .filter(|(n, _)| n == "response.output_text.delta")
+            .map(|(_, e)| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "Hello ☀");
+        let call = events
+            .iter()
+            .find(|(n, e)| n == "response.output_item.added" && e["item"]["type"] == "function_call")
+            .map(|(_, e)| &e["item"])
+            .unwrap();
+        assert_eq!(call["call_id"], "toolu_1");
+        assert_eq!(call["name"], "get_weather");
+        let arguments: String = events
+            .iter()
+            .filter(|(n, _)| n == "response.function_call_arguments.delta")
+            .map(|(_, e)| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(arguments, r#"{"city": "Paris"}"#);
+        let (last_name, completed) = events.last().unwrap();
+        assert_eq!(last_name, "response.completed");
+        assert_eq!(completed["response"]["usage"]["output_tokens"], 42);
+
+        // All three requests reached the upstream as Anthropic streaming calls.
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 3);
+        for (headers, body) in captured.iter() {
+            assert_eq!(headers["anthropic-version"], "2023-06-01");
+            assert_eq!(headers["x-api-key"], "test-key");
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["model"], "claude-opus-4-8");
+        }
+        assert_eq!(captured[0].0["anthropic-beta"], "task-budgets-2026-03-13");
+        assert_eq!(captured[0].1["tools"][0]["name"], "get_weather");
+        assert!(captured[1].0.get("anthropic-beta").is_none());
+        assert!(captured[2].0.get("anthropic-beta").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_upstream_error_event_aborts_client_stream_instead_of_completing_it() {
+        let (upstream, _) = spawn_mock_anthropic(ANTHROPIC_ERROR_SSE).await;
+        let router = spawn_router_to_anthropic(upstream).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{router}/v1/messages"))
+            .json(&json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body = resp.bytes_stream();
+        let mut received = String::new();
+        let mut errored = false;
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(bytes) => received.push_str(&String::from_utf8_lossy(&bytes)),
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(errored, "client stream should fail, got: {received}");
+        assert!(received.contains("Hel"), "text before the error should still arrive, got: {received}");
+        assert!(!received.contains("message_stop"), "stream must not look complete, got: {received}");
+    }
+
+    /// A stand-in for the Anthropic API that answers every `POST
+    /// /v1/messages` with the non-streaming reply `body`.
+    async fn spawn_mock_anthropic_json(body: Value) -> (std::net::SocketAddr, Captured) {
+        let captured = Captured::default();
+        let captured_by_handler = captured.clone();
+        let app = AxumRouter::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, Json(request): Json<Value>| {
+                let captured = captured_by_handler.clone();
+                let body = body.clone();
+                async move {
+                    captured.lock().unwrap().push((headers, request));
+                    Json(body)
+                }
+            }),
+        );
+        (serve_on_random_port(app).await, captured)
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_non_streaming_reply_with_thinking_block_is_not_a_502() {
+        // What an adaptive-thinking model returns when it thinks and the
+        // display is omitted.
+        let (upstream, captured) = spawn_mock_anthropic_json(json!({
+            "id": "msg_up", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "EqQB"},
+                {"type": "text", "text": "hi"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 7, "output_tokens": 11},
+        }))
+        .await;
+        let router = spawn_router_to_anthropic(upstream).await;
+        let client = reqwest::Client::new();
+
+        // An Anthropic client that kept the upstream's thinking block and
+        // replays it on the next turn.
+        let resp = client
+            .post(format!("http://{router}/v1/messages"))
+            .json(&json!({
+                "model": "claude-opus-5-5",
+                "max_tokens": 1024,
+                "thinking": {"type": "adaptive"},
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "", "signature": "EqQB"},
+                        {"type": "text", "text": "earlier answer"},
+                    ]},
+                    {"role": "user", "content": "second"},
+                ],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["content"], json!([{"type": "text", "text": "hi"}]));
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert_eq!(body["usage"], json!({"input_tokens": 7, "output_tokens": 11}));
+
+        // And through an OpenAI client.
+        let resp = client
+            .post(format!("http://{router}/v1/chat/completions"))
+            .json(&json!({"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "hi");
+
+        // The replayed thinking block never went upstream; the rest of the
+        // history did.
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured[0].1["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(captured[0].1["messages"][1], json!({"role": "assistant", "content": "earlier answer"}));
+    }
 }

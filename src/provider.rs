@@ -1,7 +1,7 @@
 //! A configured upstream LLM backend, and the logic to call it.
 
 use anyhow::{bail, Context};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
@@ -60,18 +60,15 @@ impl Provider {
     }
 
     /// Opens a streaming connection to the upstream and returns a channel
-    /// receiver that yields SSE-formatted `data: {...}\n\n` strings in the
-    /// OpenAI chunk format. When the stream ends normally the last item is
-    /// `data: [DONE]\n\n`. On error an `Err` item is emitted instead.
+    /// receiver that yields canonical [`StreamEvent`]s, translated from
+    /// whichever format the upstream streams in. When the stream ends
+    /// normally the last item is a [`StreamEvent::Done`]. On error an `Err`
+    /// item is emitted instead.
     pub async fn send_streaming(&self, client: &Client, req: &ChatRequest) -> anyhow::Result<ChunkStream> {
         match self.format {
             ProviderFormat::OpenAi => self.stream_openai(client, req).await,
+            ProviderFormat::Anthropic => self.stream_anthropic(client, req).await,
             ProviderFormat::Ollama => self.stream_ollama(client, req).await,
-            // Real upstream SSE streaming (content_block_delta events) isn't
-            // implemented for Anthropic-format providers — a request routed
-            // here with stream=true fails with this error rather than
-            // silently buffering. Out of scope for now; see docs/plan notes.
-            ProviderFormat::Anthropic => bail!("streaming not supported for Anthropic format"),
         }
     }
 
@@ -131,6 +128,60 @@ impl Provider {
                     }
                 }
             }
+        });
+
+        Ok(ReceiverStream::new(rx))
+    }
+
+    /// Parses the upstream's own Anthropic Messages `text/event-stream`
+    /// response into canonical [`StreamEvent`]s via
+    /// [`anthropic::AnthropicStreamDecoder`]. An upstream `error` event, or
+    /// the upstream closing the connection before `message_stop`, ends the
+    /// stream with an `Err`.
+    async fn stream_anthropic(&self, client: &Client, req: &ChatRequest) -> anyhow::Result<ChunkStream> {
+        let resp = self
+            .anthropic_post(client, req)?
+            .send()
+            .instrument(tracing::info_span!("provider.http", provider = %self.name, kind = "anthropic_stream"))
+            .await
+            .with_context(|| format!("calling provider '{}'", self.name))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await?;
+            bail!("provider '{}' returned {}: {}", self.name, status, text);
+        }
+
+        let name = self.name.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            let mut decoder = anthropic::AnthropicStreamDecoder::default();
+            let mut byte_stream = resp.bytes_stream();
+            let mut buf = Vec::new();
+
+            while let Some(chunk) = byte_stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(e) => { tx.send(Err(anyhow::anyhow!(e))).await.ok(); return; }
+                };
+                buf.extend_from_slice(&bytes);
+
+                for line in drain_lines(&mut buf) {
+                    let events = match decoder.decode_line(&line) {
+                        Ok(events) => events,
+                        Err(e) => {
+                            tx.send(Err(anyhow::anyhow!("provider '{name}': {e}"))).await.ok();
+                            return;
+                        }
+                    };
+
+                    for event in events {
+                        let done = matches!(event, StreamEvent::Done { .. });
+                        if tx.send(Ok(event)).await.is_err() || done { return; }
+                    }
+                }
+            }
+
+            tx.send(Err(anyhow::anyhow!("provider '{name}' ended its stream before message_stop"))).await.ok();
         });
 
         Ok(ReceiverStream::new(rx))
@@ -300,7 +351,11 @@ impl Provider {
         Ok(parsed.into())
     }
 
-    async fn send_anthropic(&self, client: &Client, req: &ChatRequest) -> anyhow::Result<ChatResponse> {
+    /// `POST {base_url}/messages` with Anthropic's version, beta and auth
+    /// headers. Shared by [`Self::send_anthropic`] and
+    /// [`Self::stream_anthropic`], which differ only in `req.stream` (carried
+    /// in the body).
+    fn anthropic_post(&self, client: &Client, req: &ChatRequest) -> anyhow::Result<RequestBuilder> {
         let body = anthropic::AnthropicMessagesRequest::from(req);
         let url = format!("{}/messages", self.base_url);
 
@@ -314,8 +369,12 @@ impl Provider {
         if let Some(key) = self.api_key()? {
             rb = rb.header("x-api-key", key);
         }
+        Ok(rb)
+    }
 
-        let resp = rb
+    async fn send_anthropic(&self, client: &Client, req: &ChatRequest) -> anyhow::Result<ChatResponse> {
+        let resp = self
+            .anthropic_post(client, req)?
             .send()
             .instrument(tracing::info_span!("provider.http", provider = %self.name, kind = "anthropic_messages"))
             .await
@@ -368,6 +427,19 @@ fn anthropic_beta_header(req: &ChatRequest) -> Option<&'static str> {
     }
 }
 
+/// Removes every complete `\n`-terminated line from the front of `buf` and
+/// returns them trimmed. A line is only decoded as UTF-8 once it's complete,
+/// so a multi-byte character split across two network chunks survives
+/// intact.
+fn drain_lines(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=nl).collect();
+        lines.push(String::from_utf8_lossy(&line).trim().to_owned());
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +474,20 @@ mod tests {
     fn task_budget_requires_beta_header() {
         let req = request(Some(json!({"type": "tokens", "total": 64000})));
         assert_eq!(anthropic_beta_header(&req), Some("task-budgets-2026-03-13"));
+    }
+
+    #[test]
+    fn drain_lines_keeps_partial_line_and_split_multibyte_char_buffered() {
+        let sun = "☀".as_bytes();
+        let mut buf = b"data: one\r\ndata: t".to_vec();
+        buf.extend_from_slice(&sun[..1]);
+
+        assert_eq!(drain_lines(&mut buf), vec!["data: one".to_string()]);
+
+        buf.extend_from_slice(&sun[1..]);
+        buf.extend_from_slice(b"wo\n\n");
+        assert_eq!(drain_lines(&mut buf), vec!["data: t☀wo".to_string(), String::new()]);
+        assert!(buf.is_empty());
     }
 
     #[test]
