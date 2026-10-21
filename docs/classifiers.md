@@ -34,8 +34,10 @@ logged as a warning and skipped — a failed classifier never fails the
 request, it just means that classifier's tags are missing.
 
 A classifier can also pick the model to route to outright, by returning a
-`route` (see [`cev`](#cev)). The first one returned becomes
-`ChatRequest.route`, which a [`cev` router rule](routers.md#cev) acts on.
+`route` (see [`cev`](#cev) and [`llm`](#llm)). The first one returned
+becomes `ChatRequest.route`, which a [`cev`](routers.md#cev) or
+[`llm`](routers.md#llm) router rule acts on — each only on its own
+classifier's picks.
 
 `ChatRequest.tags` and `ChatRequest.route` are not forwarded to providers,
 but are recorded in the request log (`tags` and `route` fields) alongside
@@ -151,6 +153,65 @@ adapter for `task` straight away; it starts serving the adapter once it has
 says where that stands (`task_examples`, `adapter_active`). Labelling the
 model that was picked confirms it, which is as useful as a correction.
 
+### `llm`
+
+Asks a chat model which of the configured models should answer the
+request — any model a configured provider serves, e.g. Claude Haiku through
+an [`anthropic` provider](providers.md#format--anthropic), or a local one
+through Ollama. The model gets the options (name and description) in its
+system prompt and the request's system prompt and latest user message as
+its message, and replies with the name of one option.
+
+```toml
+[classifiers.llm]
+enabled  = true
+provider = "anthropic"          # the provider to ask
+model    = "claude-haiku-5-5"   # and which of its models
+
+[[classifiers.llm.models]]
+provider    = "anthropic"
+model       = "claude-sonnet-5-5"
+description = "Hard problems: architecture, tricky bugs, long documents"
+
+[[classifiers.llm.models]]
+provider    = "ollama"
+model       = "llama3.1:8b"
+description = "General questions, writing, summarizing and conversation"
+
+[[routers]]
+type = "llm"
+```
+
+Like `cev`, it produces no tags, and its pick only affects routing through
+an [`llm` rule](routers.md#llm).
+
+| Setting | Default | |
+|---|---|---|
+| `provider` | | Name of the provider to ask. If it has an `api_key_env`, that variable has to be set, or the router won't start. |
+| `model` | | The model to ask, as that provider names it. |
+| `models` | | The options to choose between (at least two), the same as `cev`'s. |
+| `instructions` | "Which model is best suited to answer this request?" | The question. |
+| `timeout_ms` | `5000` | How long to wait for an answer before routing without one. |
+| `max_chars` | `2000` | How much of the system prompt and of the message to send. |
+| `max_tokens` | `64` | Cap on the answer. Raise it for a model that thinks before answering (a `<think>…</think>` block is skipped). |
+
+An option on a provider whose `api_key_env` isn't set is dropped with a
+warning, the same way the router skips that provider. If the answer
+doesn't name exactly one option, the call fails, or it takes longer than
+`timeout_ms`, the request is routed without a pick.
+
+**Compared with `cev`.** No second server or GPU, and the judgment of
+whichever model you pick — but every request waits for a full chat
+completion (and, for a cloud model, pays for one) before it's routed. A pick
+has no probabilities (`confidence` is always 1), and can't be corrected:
+there's no decision id, so no `x-cev-*` headers and no `/v1/feedback`. With
+both classifiers enabled only `cev`'s pick is kept, so enable one.
+
+Both classify each request on its own: the latest user message that has
+text (so an agent's tool-result turns are classified by what the user last
+asked), not the conversation, which means turns of one conversation can go
+to different models.
+
 ## Using tags in routers
 
 Add a `tag`-type rule to `routers` (checked in order, like any other rule):
@@ -166,7 +227,8 @@ rewrite_model = "gpt-4o"
 ## Writing a new classifier
 
 1. Add a module under `src/classifiers/`, implement `Classifier` for a unit
-   struct (or, like `cev`, for one built from its settings at startup).
+   struct (or, like `cev` and `llm`, for one built from its settings at
+   startup).
 2. Register it in `ClassifierRegistry::from_config`
    (`src/classifiers/mod.rs`).
 3. Document its `id()`, any `[classifiers.<id>]` settings it reads via

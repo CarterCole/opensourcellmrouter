@@ -128,7 +128,8 @@ impl ModelRouter {
     /// it (after any `rewrite_model`). `tags` are the classifier tags
     /// assigned to this request (see [`crate::classifiers`]), consulted by
     /// [`RouterRule::Tag`] rules; `route` is the model a classifier picked
-    /// for it, if any, consulted by [`RouterRule::Cev`] rules. `needed` is
+    /// for it, if any, consulted by [`RouterRule::Cev`] and
+    /// [`RouterRule::Llm`] rules. `needed` is
     /// what the request structurally requires (see
     /// [`crate::canonical::ChatRequest::needed_capabilities`]); a rule whose
     /// candidate model doesn't support everything in `needed` is treated as
@@ -256,7 +257,10 @@ impl ModelRouter {
                 })
             }
             RouterRule::Cev { min_confidence } => route
-                .filter(|route| route.confidence >= *min_confidence)
+                .filter(|route| route.classifier == "cev" && route.confidence >= *min_confidence)
+                .map(|route| (route.provider.clone(), route.model.clone())),
+            RouterRule::Llm => route
+                .filter(|route| route.classifier == "llm")
                 .map(|route| (route.provider.clone(), route.model.clone())),
         }
     }
@@ -553,7 +557,8 @@ mod tests {
         let router = ModelRouter::from_config(&config).unwrap();
 
         let picked = |confidence: f64| RouteChoice {
-            decision_id: "dec_1".to_string(),
+            classifier: "cev".to_string(),
+            decision_id: Some("dec_1".to_string()),
             choice: "small".to_string(),
             provider: "local".to_string(),
             model: "llama3.2-3b".to_string(),
@@ -583,5 +588,55 @@ mod tests {
         let (provider, model) = router.resolve("local/x", &[], Some(&other), &[]).unwrap();
         assert_eq!(provider.name, "local");
         assert_eq!(model, "local/x");
+    }
+
+    #[test]
+    fn cev_and_llm_rules_each_route_only_their_own_classifiers_picks() {
+        let config: Config = toml::from_str(
+            r#"
+            [[providers]]
+            name = "local"
+            format = "openai"
+            base_url = "http://localhost:8080/v1"
+
+            [[providers]]
+            name = "ollama"
+            format = "ollama"
+            base_url = "http://localhost:11434"
+
+            [[routers]]
+            type = "cev"
+
+            [[routers]]
+            type = "llm"
+
+            [[routers]]
+            type = "fallback"
+            providers = ["ollama"]
+            "#,
+        )
+        .unwrap();
+        let router = ModelRouter::from_config(&config).unwrap();
+
+        let picked_by = |classifier: &str| RouteChoice {
+            classifier: classifier.to_string(),
+            decision_id: None,
+            choice: "small".to_string(),
+            provider: "local".to_string(),
+            model: "llama3.2-3b".to_string(),
+            confidence: 1.0,
+            probabilities: Default::default(),
+            adapted: false,
+        };
+
+        // An `llm` pick passes the `cev` rule by and is taken by the `llm` one.
+        let (provider, model) = router.resolve("gpt-4", &[], Some(&picked_by("llm")), &[]).unwrap();
+        assert_eq!(provider.name, "local");
+        assert_eq!(model, "llama3.2-3b");
+
+        // A pick from some other classifier matches neither.
+        let (provider, model) = router.resolve("gpt-4", &[], Some(&picked_by("other")), &[]).unwrap();
+        assert_eq!(provider.name, "ollama");
+        assert_eq!(model, "gpt-4");
     }
 }

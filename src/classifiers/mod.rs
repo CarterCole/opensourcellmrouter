@@ -13,22 +13,26 @@
 //! are merged (de-duplicated) into [`ChatRequest::tags`](crate::canonical::ChatRequest::tags).
 //! `routers` rules — in particular [`crate::config::RouterRule::Tag`] — can
 //! then match on those tags. A classifier can also pick the model to route
-//! to outright (see [`cev`]), for a [`crate::config::RouterRule::Cev`] rule
-//! to act on. A classifier that errors is logged and skipped; it never
+//! to outright (see [`cev`] and [`llm`]), for a
+//! [`crate::config::RouterRule::Cev`] or [`crate::config::RouterRule::Llm`]
+//! rule to act on. A classifier that errors is logged and skipped; it never
 //! fails the request.
 
 pub mod cev;
 pub mod keyword;
+pub mod llm;
 pub mod refusal;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::canonical::{ChatRequest, ChatResponse, RouteChoice};
-use crate::config::{Config, RouterRule};
+use crate::canonical::{ChatRequest, ChatResponse, Role, RouteChoice};
+use crate::config::{Config, ProviderConfig, RouterRule};
 
 /// Per-classifier settings, from `[classifiers.<id>]` in config.
 pub struct ClassifierContext {
@@ -60,6 +64,61 @@ pub trait Classifier: Send + Sync {
     /// labeled with, e.g. `["vision"]`, and/or the model it should be
     /// routed to. Returning neither means "no opinion".
     async fn classify(&self, ctx: &ClassifierContext, req: &ChatRequest) -> anyhow::Result<Classification>;
+}
+
+/// One model a routing classifier ([`cev`] or [`llm`]) can pick, from its
+/// `[[classifiers.<id>.models]]` config.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOption {
+    /// What the option is picked and labeled by; defaults to `model`.
+    pub name: Option<String>,
+    /// What the model is good at, shown to the classifier next to the name.
+    pub description: Option<String>,
+    pub provider: String,
+    pub model: String,
+}
+
+impl ModelOption {
+    pub fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.model)
+    }
+}
+
+/// Checks that every option names one of `providers`, and that no two
+/// share a name.
+fn check_models(models: &[ModelOption], providers: &[ProviderConfig]) -> anyhow::Result<()> {
+    let mut names = HashSet::new();
+    for option in models {
+        if !providers.iter().any(|p| p.name == option.provider) {
+            bail!("model '{}' names unknown provider '{}'", option.name(), option.provider);
+        }
+        if !names.insert(option.name()) {
+            bail!("two models are named '{}'; give one of them a different `name`", option.name());
+        }
+    }
+    Ok(())
+}
+
+/// Text of the latest user message that has any — skipping turns that only
+/// carry tool results, so an agent's tool loop is classified by what the
+/// user last asked for.
+fn latest_user_text(req: &ChatRequest) -> String {
+    req.messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == Role::User)
+        .map(|m| m.text_content())
+        .find(|text| !text.is_empty())
+        .unwrap_or_default()
+}
+
+/// The first `max` characters of `s`.
+fn clip(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((end, _)) => &s[..end],
+        None => s,
+    }
 }
 
 struct ClassifierEntry {
@@ -95,11 +154,29 @@ impl ClassifierRegistry {
             classifiers.push(cev.clone());
         }
 
-        let has_rule = config.routers.iter().any(|r| matches!(r, RouterRule::Cev { .. }));
-        if cev.is_some() && !has_rule {
-            tracing::warn!("classifier 'cev' is enabled, but no `type = \"cev\"` rule in `routers` uses its picks");
-        } else if cev.is_none() && has_rule {
-            tracing::warn!("`routers` has a `type = \"cev\"` rule, but classifier 'cev' isn't enabled, so it never matches");
+        // `llm` likewise holds the provider it asks.
+        let llm = match config.classifiers.get("llm").filter(|c| c.enabled) {
+            Some(cfg) => {
+                let classifier = llm::LlmClassifier::from_settings(&cfg.settings, &config.providers)
+                    .context("configuring classifier 'llm'")?;
+                classifiers.push(Arc::new(classifier));
+                true
+            }
+            None => false,
+        };
+
+        for (id, enabled, has_rule) in [
+            ("cev", cev.is_some(), config.routers.iter().any(|r| matches!(r, RouterRule::Cev { .. }))),
+            ("llm", llm, config.routers.iter().any(|r| matches!(r, RouterRule::Llm))),
+        ] {
+            if enabled && !has_rule {
+                tracing::warn!("classifier '{id}' is enabled, but no `type = \"{id}\"` rule in `routers` uses its picks");
+            } else if !enabled && has_rule {
+                tracing::warn!("`routers` has a `type = \"{id}\"` rule, but classifier '{id}' isn't enabled, so it never matches");
+            }
+        }
+        if cev.is_some() && llm {
+            tracing::warn!("classifiers 'cev' and 'llm' are both enabled; only cev's pick is kept, so 'llm' is asked for nothing");
         }
 
         let entries = classifiers

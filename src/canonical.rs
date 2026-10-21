@@ -122,8 +122,9 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing)]
     pub tags: Vec<String>,
     /// The model a classifier picked for this request, if one did (see
-    /// [`crate::classifiers::cev`]). Consumed by
-    /// [`crate::config::RouterRule::Cev`]. Not forwarded to providers.
+    /// [`crate::classifiers::cev`] and [`crate::classifiers::llm`]).
+    /// Consumed by [`crate::config::RouterRule::Cev`] and
+    /// [`crate::config::RouterRule::Llm`]. Not forwarded to providers.
     #[serde(default, skip_serializing)]
     pub route: Option<RouteChoice>,
 }
@@ -131,19 +132,26 @@ pub struct ChatRequest {
 /// A classifier's pick of which model should answer a request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteChoice {
-    /// Id of the decision behind this pick. Send it to `POST /v1/feedback`
-    /// with the model that should have been picked to correct (or confirm)
-    /// it.
-    pub decision_id: String,
+    /// Id of the classifier that made this pick: `"cev"` or `"llm"`.
+    pub classifier: String,
+    /// Id of the `cev` decision behind this pick. Send it to
+    /// `POST /v1/feedback` with the model that should have been picked to
+    /// correct (or confirm) it. `None` for `llm` picks, which can't be
+    /// corrected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
     /// Name of the option that was picked.
     pub choice: String,
     pub provider: String,
     pub model: String,
-    /// 0 = every option equally likely, 1 = certain.
+    /// 0 = every option equally likely, 1 = certain. Always 1 for `llm`
+    /// picks, which come without one.
     pub confidence: f64,
-    /// Probability of each option, by name.
+    /// Probability of each option, by name. Empty for `llm` picks.
+    #[serde(default)]
     pub probabilities: IndexMap<String, f64>,
     /// Whether what was learned from earlier feedback shaped this pick.
+    #[serde(default)]
     pub adapted: bool,
 }
 
@@ -151,6 +159,16 @@ impl RouteChoice {
     /// Probability of the option that was picked.
     pub fn probability(&self) -> f64 {
         self.probabilities.get(&self.choice).copied().unwrap_or_default()
+    }
+
+    /// One-line summary for the request log viewers, e.g.
+    /// `cev:general 82%` or `llm:general`.
+    pub fn summary(&self) -> String {
+        if self.probabilities.is_empty() {
+            format!("{}:{}", self.classifier, self.choice)
+        } else {
+            format!("{}:{} {:.0}%", self.classifier, self.choice, self.probability() * 100.0)
+        }
     }
 }
 

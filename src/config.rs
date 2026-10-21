@@ -144,6 +144,11 @@ pub enum RouterRule {
         #[serde(default)]
         min_confidence: f64,
     },
+    /// Routes to the model the `llm` classifier picked for this request
+    /// (see [`crate::classifiers::llm`]). Passes through if it made no pick
+    /// — it's disabled, failed, timed out, or answered with something other
+    /// than one of its `models`.
+    Llm,
 }
 
 #[derive(Debug, Clone, Deserialize)]

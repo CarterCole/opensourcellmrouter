@@ -149,11 +149,17 @@ function fmtTime(ms) {
   return d.toLocaleTimeString();
 }
 
+// A message's content is a list of parts (text, images, tool calls and
+// results); only the text parts are shown.
+function textOf(message) {
+  return message.content.filter(p => p.type === 'text').map(p => p.text).join('');
+}
+
 function lastUserMessage(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === 'user') return messages[i].content;
+    if (messages[i].role === 'user') return textOf(messages[i]);
   }
-  return messages.length ? messages[messages.length - 1].content : '';
+  return messages.length ? textOf(messages[messages.length - 1]) : '';
 }
 
 function pill(text, cls) {
@@ -167,9 +173,10 @@ function toggleExpand(e) {
   e.currentTarget.classList.toggle('expanded');
 }
 
-// The cev classifier's pick for a request: one button per model it chose
+// A classifier's pick for a request. For cev: one button per model it chose
 // between, with the probability it gave each. Clicking a model reports it
-// as the one that should have answered, which cev learns from.
+// as the one that should have answered, which cev learns from. An llm pick
+// has neither probabilities nor a decision to correct, so it's just named.
 function renderRoute(entry) {
   const route = entry.route;
   const row = document.createElement('div');
@@ -177,11 +184,16 @@ function renderRoute(entry) {
 
   const label = document.createElement('span');
   label.className = 'label';
-  label.textContent = 'cev:';
+  label.textContent = route.classifier + ':';
   row.appendChild(label);
 
   const status = document.createElement('span');
   const used = entry.provider === route.provider && entry.sent_model === route.model;
+  if (!route.decision_id) {
+    status.textContent = ['picked ' + route.choice, used ? '' : 'not used'].filter(Boolean).join(' · ');
+    row.appendChild(status);
+    return row;
+  }
   status.textContent = [
     Math.round(route.confidence * 100) + '% confident',
     route.adapted ? 'adapted' : '',

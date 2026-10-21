@@ -105,7 +105,7 @@ fn print_entry(e: &LogEntry) {
         header.push_str(&format!("  {YELLOW}[{tag}]{RESET}"));
     }
     if let Some(route) = &e.route {
-        header.push_str(&format!("  {GREEN}cev:{} {:.0}%{RESET}", route.choice, route.probability() * 100.0));
+        header.push_str(&format!("  {GREEN}{}{RESET}", route.summary()));
     }
     for plugin in &e.plugins {
         header.push_str(&format!("  {MAGENTA}({plugin}){RESET}"));

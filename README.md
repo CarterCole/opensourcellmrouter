@@ -95,7 +95,7 @@ quality            = 90
 [[providers]]
 name               = "anthropic"
 format             = "anthropic"
-base_url           = "https://api.anthropic.com"
+base_url           = "https://api.anthropic.com/v1"
 api_key_env        = "ANTHROPIC_API_KEY"
 cost_per_1m_tokens = 15.0
 quality            = 95
@@ -145,6 +145,30 @@ type          = "tag"
 tag           = "code"
 provider      = "ollama"
 rewrite_model = "deepseek-r1:latest"
+```
+
+### `llm` — let a model pick
+
+The [`llm` classifier](docs/classifiers.md#llm) asks a chat model on one of your providers (e.g. Claude Haiku) which of a list of models should answer each request; this rule routes there. (The [`cev` classifier](docs/classifiers.md#cev) does the same with a small local model that learns from corrections.)
+
+```toml
+[classifiers.llm]
+enabled  = true
+provider = "anthropic"
+model    = "claude-haiku-5-5"
+
+[[classifiers.llm.models]]
+provider    = "anthropic"
+model       = "claude-sonnet-5-5"
+description = "Hard problems: architecture, tricky bugs, long documents"
+
+[[classifiers.llm.models]]
+provider    = "ollama"
+model       = "llama3.1:8b"
+description = "General questions, writing, summarizing and conversation"
+
+[[routers]]
+type = "llm"
 ```
 
 ### `discover` — route to Ollama if it has the model

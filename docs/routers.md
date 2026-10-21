@@ -78,6 +78,22 @@ min_confidence = 0.25
 Rules before it in the chain win over the pick, so put explicit ones like
 `prefix` first; rules after it handle what cev was unsure of.
 
+### `llm`
+
+Routes to the model the [`llm` classifier](classifiers.md#llm) picked for
+this request: both the provider and the model name come from the pick.
+Passes through if there is no pick — the classifier is disabled, failed,
+timed out, or answered with something that isn't one of its `models`.
+
+```toml
+[[routers]]
+type = "llm"
+```
+
+As with `cev`, rules before it win over the pick — e.g. a `prefix` rule that
+sends `claude-*` requests straight to Anthropic, so clients can still ask
+for a model by name.
+
 ### `price`
 
 Picks the candidate provider with the lowest `cost_per_1m_tokens`. If

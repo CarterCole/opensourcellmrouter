@@ -59,7 +59,6 @@
 //! GPU on macOS (add `--features cuda` for an NVIDIA one); `url` works in
 //! any build.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -70,8 +69,8 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use super::{Classification, Classifier, ClassifierContext};
-use crate::canonical::{ChatRequest, Role, RouteChoice};
+use super::{Classification, Classifier, ClassifierContext, ModelOption, check_models, clip, latest_user_text};
+use crate::canonical::{ChatRequest, RouteChoice};
 use crate::config::ProviderConfig;
 
 /// Id of the one question in each request to cev.
@@ -107,22 +106,6 @@ impl Default for Settings {
     }
 }
 
-/// One model cev can pick.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelOption {
-    name: Option<String>,
-    description: Option<String>,
-    provider: String,
-    model: String,
-}
-
-impl ModelOption {
-    fn name(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.model)
-    }
-}
-
 pub struct CevClassifier {
     cev: Cev,
     /// The question asked about every request.
@@ -154,16 +137,7 @@ impl CevClassifier {
             _ => bail!("set either `url` (a running cev server) or `model` (to run one in-process)"),
         };
 
-        let mut names = HashSet::new();
-        for option in &settings.models {
-            if !providers.iter().any(|p| p.name == option.provider) {
-                bail!("model '{}' names unknown provider '{}'", option.name(), option.provider);
-            }
-            if !names.insert(option.name()) {
-                bail!("two models are named '{}'; give one of them a different `name`", option.name());
-            }
-        }
-
+        check_models(&settings.models, providers)?;
         Self::new(cev, settings)
     }
 
@@ -195,13 +169,7 @@ impl CevClassifier {
     /// What cev is shown of `req`: the system prompt and the latest user
     /// message, each cut to `max_chars`.
     fn state(&self, req: &ChatRequest) -> Value {
-        let message = req
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::User)
-            .map(|m| m.text_content())
-            .unwrap_or_default();
+        let message = latest_user_text(req);
 
         let mut state = Map::new();
         if let Some(system) = &req.system {
@@ -250,14 +218,6 @@ fn local(_model: &str, _db: &str) -> anyhow::Result<Cev> {
     )
 }
 
-/// The first `max` characters of `s`.
-fn clip(s: &str, max: usize) -> &str {
-    match s.char_indices().nth(max) {
-        Some((end, _)) => &s[..end],
-        None => s,
-    }
-}
-
 #[async_trait]
 impl Classifier for CevClassifier {
     fn id(&self) -> &'static str {
@@ -296,7 +256,8 @@ impl Classifier for CevClassifier {
         Ok(Classification {
             tags: Vec::new(),
             route: Some(RouteChoice {
-                decision_id: meta.decision_id.clone(),
+                classifier: "cev".to_string(),
+                decision_id: Some(meta.decision_id.clone()),
                 choice: choice.clone(),
                 provider: picked.provider.clone(),
                 model: picked.model.clone(),
@@ -317,7 +278,7 @@ pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::canonical::Message;
+    use crate::canonical::{Message, Role};
 
     fn settings(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()
@@ -392,7 +353,7 @@ pub(crate) mod tests {
         let picked = route(&classifier, "I need help debugging these algorithms").await;
         assert_eq!(picked.choice, "deepseek-r1:latest");
         assert_eq!((picked.provider.as_str(), picked.model.as_str()), ("ollama", "deepseek-r1:latest"));
-        assert!(!picked.decision_id.is_empty());
+        assert!(picked.decision_id.as_deref().is_some_and(|id| !id.is_empty()));
         assert_eq!(picked.probabilities.keys().collect::<Vec<_>>(), ["deepseek-r1:latest", "general"]);
 
         // An option is picked and labeled by its `name`, and routes to its `model`.
@@ -416,7 +377,7 @@ pub(crate) mod tests {
         let mut learned = None;
         for i in 0..8 {
             let decision = route(&classifier, &ask(i)).await;
-            learned = Some(classifier.feedback(&decision.decision_id, "general", None).await.unwrap());
+            learned = Some(classifier.feedback(decision.decision_id.as_deref().unwrap(), "general", None).await.unwrap());
         }
         let learned = learned.unwrap();
         assert!(learned.learned);
@@ -435,7 +396,7 @@ pub(crate) mod tests {
         let classifier = mock_classifier();
         let decision = route(&classifier, "hello").await;
 
-        let err = classifier.feedback(&decision.decision_id, "gpt-4", None).await.unwrap_err();
+        let err = classifier.feedback(decision.decision_id.as_deref().unwrap(), "gpt-4", None).await.unwrap_err();
         assert!(matches!(err, cev::Error::Api { status: 400, .. }), "{err}");
 
         let err = classifier.feedback("dec_missing", "general", None).await.unwrap_err();

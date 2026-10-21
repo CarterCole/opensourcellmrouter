@@ -36,7 +36,7 @@ Start → classifiers → PreRouting → routers → provider → PostResponse �
 ```
 
 1. Plugin `on_start` hooks
-2. `classifiers` tag the request (e.g. `"vision"`, `"nsfw"`), or pick its model outright (`cev`)
+2. `classifiers` tag the request (e.g. `"vision"`, `"nsfw"`), or pick its model outright (`cev`, `llm`)
 3. Plugin `pre_request` hooks (can set `forced_provider` to bypass routing)
 4. `routers` chain picks a provider and optionally rewrites the model name
 5. Request forwarded to the chosen provider
@@ -55,7 +55,7 @@ A plugin hook returning `Flow::Stop` from `on_start`/`pre_request` skips routing
 - **`server.rs`** — Axum routes, `AppState`, and the `dispatch()` function that orchestrates the full pipeline. Also serves the live dashboard and `POST /v1/feedback`.
 - **`formats/`** — Wire-format adapters: `openai.rs`, `anthropic.rs`, `ollama.rs`. Each implements `From`/`Into` for `ChatRequest`/`ChatResponse`.
 - **`plugins/mod.rs`** — `Plugin` trait and `PluginRegistry`. Plugins registered here in a fixed order; config enables/disables defaults; requests can opt in per-call via `"plugins": [{"id": "..."}]`.
-- **`classifiers/mod.rs`** — `Classifier` trait/`ClassifierRegistry` (pre-routing, request tags; `keyword.rs`) and `ResponseClassifier` trait/`ResponseClassifierRegistry` (post-response, response tags; `refusal.rs`). `cev.rs` asks a [cev](https://github.com/CarterCole/rust-cev) model which configured model should answer (`ChatRequest.route`) and takes corrections via `POST /v1/feedback`, keyed by the `x-cev-decision-id` response header.
+- **`classifiers/mod.rs`** — `Classifier` trait/`ClassifierRegistry` (pre-routing, request tags; `keyword.rs`) and `ResponseClassifier` trait/`ResponseClassifierRegistry` (post-response, response tags; `refusal.rs`). `cev.rs` asks a [cev](https://github.com/CarterCole/rust-cev) model which configured model should answer (`ChatRequest.route`) and takes corrections via `POST /v1/feedback`, keyed by the `x-cev-decision-id` response header. `llm.rs` asks a chat model on a configured provider (e.g. `claude-haiku-5-5`) the same question; its picks have no confidence and no feedback. `RouteChoice.classifier` says which made a pick.
 - **`provider.rs`** — `Provider` wraps a `ProviderConfig` and handles the actual HTTP call to the upstream, translating via `formats/`.
 
 ### Router rules (evaluated in order, first match wins)
@@ -65,6 +65,7 @@ A plugin hook returning `Flow::Stop` from `on_start`/`pre_request` skips routing
 | `prefix` | `model` starts with `model_prefix` |
 | `tag` | a classifier tag matches |
 | `cev` | the `cev` classifier picked a model with at least `min_confidence` (routes to that provider + model) |
+| `llm` | the `llm` classifier picked a model (routes to that provider + model) |
 | `price` | picks lowest-cost candidate (pass-through if none qualify) |
 | `latency` | picks lowest-latency candidate |
 | `throughput` | picks highest-throughput candidate |

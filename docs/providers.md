@@ -37,7 +37,16 @@ OpenAI-compatible cloud APIs such as Cloudflare Workers AI or
 ## `format = "anthropic"`
 
 Speaks the Anthropic Messages API: `POST {base_url}/messages` with an
-`anthropic-version` header and `x-api-key` auth from `api_key_env`.
+`anthropic-version` header and `x-api-key` auth from `api_key_env`. Since
+`/messages` is appended directly, `base_url` includes the `/v1`:
+
+```toml
+[[providers]]
+name        = "anthropic"
+format      = "anthropic"
+base_url    = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+```
 
 ## `format = "ollama"`
 

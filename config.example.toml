@@ -83,7 +83,7 @@ throughput_tokens_per_sec = 80
 [[providers]]
 name               = "anthropic"
 format             = "anthropic"
-base_url           = "https://api.anthropic.com"
+base_url           = "https://api.anthropic.com/v1"
 api_key_env        = "ANTHROPIC_API_KEY"
 cost_per_1m_tokens = 15.0
 quality            = 95
@@ -118,6 +118,26 @@ code   = ["function", "class", "import", "def ", "fn ", "bug", "error", "stack t
 nsfw   = ["nsfw", "adult", "explicit", "erotic", "nude", "naked",
           "sexual", "xxx", "porn", "hentai", "fetish", "lewd"]
 
+# Let a model pick the route: Claude Haiku reads each request and names one
+# of the models below, and the `type = "llm"` rule (commented out under
+# routers) sends the request there. Costs a Haiku call per request.
+# See docs/classifiers.md#llm.
+#
+# [classifiers.llm]
+# enabled  = true
+# provider = "anthropic"
+# model    = "claude-haiku-5-5"
+#
+# [[classifiers.llm.models]]
+# provider    = "anthropic"
+# model       = "claude-sonnet-5-5"
+# description = "Hard problems: architecture, tricky bugs, long documents"
+#
+# [[classifiers.llm.models]]
+# provider    = "ollama"
+# model       = "llama3.1:8b"
+# description = "General questions, writing, summarizing and conversation"
+
 # ── response classifiers ────────────────────────────────────────────────────────
 # Tag the response after the provider replies (e.g. detect refusals). Tags land
 # in the X-Router-Tags response header and in logs/dashboard — never in the
@@ -127,6 +147,11 @@ nsfw   = ["nsfw", "adult", "explicit", "erotic", "nude", "naked",
 enabled = true
 
 # ── routers (first match wins) ────────────────────────────────────────────────
+
+# With [classifiers.llm] enabled above, route to whatever it picked. It has to
+# come before `random`, which matches everything.
+# [[routers]]
+# type = "llm"
 
 # Pick a random model from everything we have — applies to every request.
 # Providers whose API key env var is unset are skipped automatically at startup.

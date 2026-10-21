@@ -305,7 +305,7 @@ struct DispatchOutcome {
     /// Model name actually sent to that provider (after any `rewrite_model`).
     model: String,
     /// The model a classifier picked for the request, if one did (see
-    /// [`crate::classifiers::cev`]).
+    /// [`crate::classifiers::cev`] and [`crate::classifiers::llm`]).
     route: Option<RouteChoice>,
 }
 
@@ -525,12 +525,15 @@ const X_CEV_DECISION_ID: &str = "x-cev-decision-id";
 /// Name of the option the `cev` classifier picked (`RouteChoice::choice`).
 const X_CEV_CHOICE: &str = "x-cev-choice";
 
-/// Sets [`X_CEV_DECISION_ID`] and [`X_CEV_CHOICE`] when a classifier picked
-/// the model for this request; omitted otherwise.
+/// Sets [`X_CEV_DECISION_ID`] and [`X_CEV_CHOICE`] when the `cev`
+/// classifier picked the model for this request; omitted otherwise
+/// (including for `llm` picks, which have no decision to correct).
 fn apply_route_headers(response: &mut Response, route: Option<&RouteChoice>) {
     if let Some(route) = route {
-        apply_header(response, X_CEV_DECISION_ID, &route.decision_id);
-        apply_header(response, X_CEV_CHOICE, &route.choice);
+        if let Some(decision_id) = &route.decision_id {
+            apply_header(response, X_CEV_DECISION_ID, decision_id);
+            apply_header(response, X_CEV_CHOICE, &route.choice);
+        }
     }
 }
 
@@ -775,6 +778,7 @@ async fn feedback(
 mod tests {
     use super::*;
     use crate::classifiers::cev::tests::mock_classifier;
+    use crate::classifiers::llm::tests::mock_provider;
     use crate::config::Config;
 
     fn header_value<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
@@ -955,5 +959,90 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let error: Value = resp.json().await.unwrap();
         assert_eq!(error["error"]["type"], "router_error");
+    }
+
+    #[tokio::test]
+    async fn llm_pick_routes_the_request() {
+        // The provider the `llm` classifier asks, which always says "general",
+        // and the one that answers.
+        let (asked, _) = mock_provider("general").await;
+        let (answering, received) = mock_provider("an answer").await;
+
+        let config: Config = toml::from_str(&format!(
+            r#"
+            [[providers]]
+            name = "router"
+            format = "openai"
+            base_url = "{asked}"
+
+            [[providers]]
+            name = "local"
+            format = "openai"
+            base_url = "{answering}"
+
+            [classifiers.llm]
+            enabled = true
+            provider = "router"
+            model = "router-model"
+
+            [[classifiers.llm.models]]
+            provider = "local"
+            model = "deepseek-r1:latest"
+
+            [[classifiers.llm.models]]
+            provider = "local"
+            model = "llama3.1:8b"
+            name = "general"
+
+            [[routers]]
+            type = "llm"
+
+            [[routers]]
+            type = "fallback"
+            providers = ["router"]
+            "#
+        ))
+        .unwrap();
+
+        let (events, mut logged) = broadcast::channel(8);
+        let state = AppState {
+            router: Arc::new(ModelRouter::from_config(&config).unwrap()),
+            client: reqwest::Client::new(),
+            logger: None,
+            plugins: Arc::new(PluginRegistry::from_config(&config)),
+            classifiers: Arc::new(ClassifierRegistry::from_config(&config).unwrap()),
+            response_classifiers: Arc::new(ResponseClassifierRegistry::from_config(&config)),
+            events,
+            in_flight: Arc::new(AtomicU64::new(0)),
+            next_id: Arc::new(AtomicU64::new(0)),
+            api_key: None,
+        };
+        let router = serve(build_app(state, false)).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{router}/v1/messages"))
+            .json(&json!({
+                "model": "claude-sonnet-5-5",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Any recipes for my travel?"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[X_ROUTER_PROVIDER], "local");
+        assert_eq!(resp.headers()[X_ROUTER_MODEL], "llama3.1:8b");
+        // There's no cev decision to correct.
+        assert!(resp.headers().get(X_CEV_DECISION_ID).is_none());
+        assert_eq!(received.lock().unwrap()[0]["model"], "llama3.1:8b");
+
+        let entry = loop {
+            let event: Value = serde_json::from_str(&logged.recv().await.unwrap()).unwrap();
+            if event["type"] == "complete" {
+                break event;
+            }
+        };
+        assert_eq!(entry["route"]["classifier"], "llm");
+        assert_eq!(entry["route"]["choice"], "general");
     }
 }

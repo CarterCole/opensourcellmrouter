@@ -148,7 +148,7 @@ candidates = [
 [[providers]]
 name               = "anthropic"
 format             = "anthropic"
-base_url           = "https://api.anthropic.com"
+base_url           = "https://api.anthropic.com/v1"
 api_key_env        = "ANTHROPIC_API_KEY"
 cost_per_1m_tokens = 15.0
 quality            = 95

@@ -74,8 +74,8 @@ pub struct LogEntry {
     /// search to find the matching trace.
     #[serde(default)]
     pub trace_id: Option<String>,
-    /// The model the `cev` classifier picked for this request, if it's
-    /// enabled (see [`crate::classifiers::cev`]) — whether or not a `cev`
+    /// The model the `cev` or `llm` classifier picked for this request, if
+    /// one is enabled (see [`crate::classifiers`]) — whether or not a
     /// router rule then acted on it.
     #[serde(default)]
     pub route: Option<RouteChoice>,
