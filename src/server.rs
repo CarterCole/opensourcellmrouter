@@ -1088,4 +1088,84 @@ mod tests {
         assert!(received.contains("Hel"), "text before the error should still arrive, got: {received}");
         assert!(!received.contains("message_stop"), "stream must not look complete, got: {received}");
     }
+
+    /// A stand-in for the Anthropic API that answers every `POST
+    /// /v1/messages` with the non-streaming reply `body`.
+    async fn spawn_mock_anthropic_json(body: Value) -> (std::net::SocketAddr, Captured) {
+        let captured = Captured::default();
+        let captured_by_handler = captured.clone();
+        let app = AxumRouter::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, Json(request): Json<Value>| {
+                let captured = captured_by_handler.clone();
+                let body = body.clone();
+                async move {
+                    captured.lock().unwrap().push((headers, request));
+                    Json(body)
+                }
+            }),
+        );
+        (serve_on_random_port(app).await, captured)
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_non_streaming_reply_with_thinking_block_is_not_a_502() {
+        // What an adaptive-thinking model returns when it thinks and the
+        // display is omitted.
+        let (upstream, captured) = spawn_mock_anthropic_json(json!({
+            "id": "msg_up", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "EqQB"},
+                {"type": "text", "text": "hi"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 7, "output_tokens": 11},
+        }))
+        .await;
+        let router = spawn_router_to_anthropic(upstream).await;
+        let client = reqwest::Client::new();
+
+        // An Anthropic client that kept the upstream's thinking block and
+        // replays it on the next turn.
+        let resp = client
+            .post(format!("http://{router}/v1/messages"))
+            .json(&json!({
+                "model": "claude-opus-5-5",
+                "max_tokens": 1024,
+                "thinking": {"type": "adaptive"},
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "", "signature": "EqQB"},
+                        {"type": "text", "text": "earlier answer"},
+                    ]},
+                    {"role": "user", "content": "second"},
+                ],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["content"], json!([{"type": "text", "text": "hi"}]));
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert_eq!(body["usage"], json!({"input_tokens": 7, "output_tokens": 11}));
+
+        // And through an OpenAI client.
+        let resp = client
+            .post(format!("http://{router}/v1/chat/completions"))
+            .json(&json!({"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "hi");
+
+        // The replayed thinking block never went upstream; the rest of the
+        // history did.
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured[0].1["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(captured[0].1["messages"][1], json!({"role": "assistant", "content": "earlier answer"}));
+    }
 }

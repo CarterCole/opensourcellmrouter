@@ -48,13 +48,37 @@ Claude Code on `/v1/messages`, Copilot CLI on `/v1/chat/completions` and
 Codex on `/v1/responses` can all stream from a Claude model, tool calls
 included. Some things don't carry over:
 
-- Thinking blocks (and server-side tool blocks such as `server_tool_use`)
-  are dropped from the stream. The client never sees them, so it can't send
-  them back on later turns, and the model answers each turn without its
-  earlier reasoning.
+- Thinking blocks, and server-side tool blocks such as `server_tool_use`, are
+  dropped from the stream, as they are from a plain reply — see
+  [Thinking blocks](#thinking-blocks).
 - An upstream `error` event mid-stream (e.g. `overloaded_error`) cuts off the
   client's connection, so the client sees a failed stream rather than one
   that looks complete.
+
+### Thinking blocks
+
+Current Claude models think adaptively by default and answer with `thinking`
+blocks (their text is empty unless the request sets `thinking.display` to
+`"summarized"`) or `redacted_thinking` blocks. The router doesn't carry them
+through, streamed or not:
+
+- They are dropped from the provider's reply. The thinking still happens and
+  is billed, and `thinking` and `output_config.effort` in a request are
+  forwarded as usual, but the client gets only the text and tool calls, and
+  summarized thinking text is discarded.
+- `thinking` and `redacted_thinking` blocks in an incoming `/v1/messages`
+  request, such as a client replaying its history, are dropped before the
+  request is forwarded. An assistant turn left with nothing in it is omitted.
+- Other block types the router doesn't model (`server_tool_use`,
+  `web_search_tool_result`, `document`, anything Anthropic adds later) are
+  dropped the same way instead of failing the request. Unlike thinking,
+  content in an incoming request is something the model won't see, so that
+  is logged as a warning.
+
+The API wants thinking blocks passed back unchanged, but accepts a history
+with none, so dropping every one is safe. The cost is that the model answers
+each turn without its earlier reasoning, between the tool calls of a single
+task included.
 
 ## `format = "ollama"`
 

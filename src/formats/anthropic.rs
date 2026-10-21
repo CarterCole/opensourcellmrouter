@@ -30,6 +30,18 @@ pub enum AnthropicContent {
     Blocks(Vec<ContentBlock>),
 }
 
+/// A content block of an Anthropic message, in a request or a reply.
+///
+/// `Thinking`, `RedactedThinking` and `Other` are parse-only: they exist so a
+/// block the canonical types can't carry doesn't fail the whole payload with
+/// `unknown variant`, and are dropped when converting to
+/// [`ContentPart`]/[`ChatResponse`] — as [`AnthropicStreamBlock::Other`] does
+/// for the streamed equivalents. `skip_serializing` makes constructing one by
+/// mistake a serialization error rather than a bogus block on the wire.
+///
+/// Dropping thinking is safe only because it is dropped everywhere: the API
+/// requires thinking blocks passed back unchanged, and accepts none at all,
+/// but a history with only some of them removed can be rejected.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -37,6 +49,16 @@ pub enum ContentBlock {
     Image { source: ImageSource },
     ToolUse { id: String, name: String, input: serde_json::Value },
     ToolResult { tool_use_id: String, content: String },
+    /// Models that think adaptively return these by default, with an empty
+    /// `thinking` when the display is omitted.
+    #[serde(skip_serializing)]
+    Thinking,
+    #[serde(skip_serializing)]
+    RedactedThinking,
+    /// Any other type, e.g. `server_tool_use` and `web_search_tool_result`
+    /// in replies, or `document` in requests.
+    #[serde(other, skip_serializing)]
+    Other,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -52,14 +74,21 @@ fn content_parts_from_anthropic(content: AnthropicContent) -> Vec<ContentPart> {
         AnthropicContent::Text(text) => vec![ContentPart::Text { text }],
         AnthropicContent::Blocks(blocks) => blocks
             .into_iter()
-            .map(|block| match block {
-                ContentBlock::Text { text } => ContentPart::Text { text },
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(ContentPart::Text { text }),
                 ContentBlock::Image { source } => {
-                    ContentPart::Image { media_type: source.media_type, data: source.data }
+                    Some(ContentPart::Image { media_type: source.media_type, data: source.data })
                 }
-                ContentBlock::ToolUse { id, name, input } => ContentPart::ToolUse { id, name, input },
+                ContentBlock::ToolUse { id, name, input } => Some(ContentPart::ToolUse { id, name, input }),
                 ContentBlock::ToolResult { tool_use_id, content } => {
-                    ContentPart::ToolResult { tool_use_id, content }
+                    Some(ContentPart::ToolResult { tool_use_id, content })
+                }
+                ContentBlock::Thinking | ContentBlock::RedactedThinking => None,
+                // Unlike thinking, this is content the client meant the model
+                // to see, so say it's being lost.
+                ContentBlock::Other => {
+                    tracing::warn!("dropping an unsupported content block from an Anthropic request");
+                    None
                 }
             })
             .collect(),
@@ -191,12 +220,18 @@ impl From<AnthropicMessagesRequest> for ChatRequest {
         let messages = req
             .messages
             .into_iter()
-            .map(|msg| Message {
-                role: match msg.role.as_str() {
-                    "assistant" => Role::Assistant,
-                    _ => Role::User,
-                },
-                content: content_parts_from_anthropic(msg.content),
+            .filter_map(|msg| {
+                let content = content_parts_from_anthropic(msg.content);
+                // A turn that held nothing but thinking blocks (cut off by
+                // `max_tokens`, say) has nothing left to send, and Anthropic
+                // rejects a message with empty `content`.
+                (!content.is_empty()).then(|| Message {
+                    role: match msg.role.as_str() {
+                        "assistant" => Role::Assistant,
+                        _ => Role::User,
+                    },
+                    content,
+                })
             })
             .collect();
 
@@ -292,7 +327,11 @@ impl From<AnthropicMessagesResponse> for ChatResponse {
             match block {
                 ContentBlock::Text { text } => content.push_str(&text),
                 ContentBlock::ToolUse { id, name, input } => tool_calls.push(ToolCall { id, name, input }),
-                ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => {}
+                ContentBlock::Image { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::Thinking
+                | ContentBlock::RedactedThinking
+                | ContentBlock::Other => {}
             }
         }
 
@@ -958,6 +997,145 @@ mod tests {
         assert_eq!(chat.stop_reason, StopReason::ToolUse);
         assert_eq!(chat.tool_calls.len(), 1);
         assert_eq!(chat.tool_calls[0].name, "get_weather");
+    }
+
+    fn response_from_json(value: serde_json::Value) -> ChatResponse {
+        serde_json::from_value::<AnthropicMessagesResponse>(value).unwrap().into()
+    }
+
+    #[test]
+    fn response_thinking_block_is_dropped_instead_of_failing_to_parse() {
+        // What an adaptive-thinking model returns when the display is omitted.
+        let chat = response_from_json(json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "x"},
+                {"type": "text", "text": "hi"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 3, "output_tokens": 9},
+        }));
+
+        assert_eq!(chat.content, "hi");
+        assert_eq!(chat.stop_reason, StopReason::EndTurn);
+        assert_eq!(chat.usage, Usage { input_tokens: 3, output_tokens: 9 });
+    }
+
+    #[test]
+    fn response_drops_redacted_thinking_and_unknown_blocks_but_keeps_text_and_tool_calls() {
+        let chat = response_from_json(json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+            "content": [
+                {"type": "thinking", "thinking": "Let me check.", "signature": "EqQB"},
+                {"type": "redacted_thinking", "data": "EmwKAhgB"},
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "weather"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                {"type": "text", "text": "Checking."},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "nyc"}},
+                {"type": "some_future_block", "detail": 1},
+            ],
+            "stop_reason": "tool_use",
+        }));
+
+        assert_eq!(chat.content, "Checking.");
+        assert_eq!(chat.stop_reason, StopReason::ToolUse);
+        assert_eq!(chat.tool_calls.len(), 1);
+        assert_eq!(chat.tool_calls[0].id, "toolu_1");
+        assert_eq!(chat.tool_calls[0].input, json!({"city": "nyc"}));
+    }
+
+    #[test]
+    fn response_with_only_thinking_before_max_tokens_is_empty_not_an_error() {
+        let chat = response_from_json(json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+            "content": [{"type": "thinking", "thinking": "", "signature": "x"}],
+            "stop_reason": "max_tokens",
+        }));
+
+        assert_eq!(chat.content, "");
+        assert!(chat.tool_calls.is_empty());
+        assert_eq!(chat.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn inbound_request_replaying_thinking_blocks_drops_them_and_keeps_the_rest() {
+        let req: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "Weather in NYC?"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Need the tool.", "signature": "EqQB"},
+                    {"type": "redacted_thinking", "data": "EmwKAhgB"},
+                    {"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "nyc"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"},
+                ]},
+            ],
+        }))
+        .unwrap();
+
+        let chat: ChatRequest = req.into();
+        assert_eq!(chat.messages.len(), 3);
+        assert_eq!(
+            chat.messages[1].content,
+            vec![
+                ContentPart::Text { text: "Checking.".to_string() },
+                ContentPart::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "get_weather".to_string(),
+                    input: json!({"city": "nyc"}),
+                },
+            ]
+        );
+        assert_eq!(
+            chat.messages[2].content,
+            vec![ContentPart::ToolResult { tool_use_id: "toolu_1".to_string(), content: "sunny".to_string() }]
+        );
+    }
+
+    #[test]
+    fn inbound_unknown_block_types_are_dropped_instead_of_rejecting_the_request() {
+        let req: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": [
+                {"type": "some_future_block", "detail": 1},
+                {"type": "text", "text": "hi"},
+            ]}],
+        }))
+        .unwrap();
+
+        let chat: ChatRequest = req.into();
+        assert_eq!(chat.messages[0].content, vec![ContentPart::Text { text: "hi".to_string() }]);
+    }
+
+    #[test]
+    fn inbound_turn_holding_only_thinking_is_omitted_entirely() {
+        let req: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": [{"type": "thinking", "thinking": "", "signature": "x"}]},
+                {"role": "user", "content": "second"},
+            ],
+        }))
+        .unwrap();
+
+        let chat: ChatRequest = req.into();
+        let texts: Vec<String> = chat.messages.iter().map(Message::text_content).collect();
+        assert_eq!(texts, vec!["first", "second"]);
+        assert!(chat.messages.iter().all(|m| m.role == Role::User));
+    }
+
+    #[test]
+    fn parse_only_blocks_refuse_to_serialize() {
+        for block in [ContentBlock::Thinking, ContentBlock::RedactedThinking, ContentBlock::Other] {
+            assert!(serde_json::to_value(&block).is_err(), "{block:?} must not reach the wire");
+        }
     }
 
     /// Feeds an upstream SSE body through a fresh decoder line by line, the
