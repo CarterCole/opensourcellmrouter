@@ -5,6 +5,9 @@
 //! request from a client, and when it forwards a request to a provider that
 //! itself speaks the Anthropic Messages API.
 
+use std::collections::HashMap;
+
+use anyhow::bail;
 use bytes::Bytes;
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
@@ -293,18 +296,11 @@ impl From<AnthropicMessagesResponse> for ChatResponse {
             }
         }
 
-        let stop_reason = match resp.stop_reason.as_deref() {
-            Some("end_turn") => StopReason::EndTurn,
-            Some("max_tokens") => StopReason::MaxTokens,
-            Some("tool_use") => StopReason::ToolUse,
-            _ => StopReason::Other,
-        };
-
         ChatResponse {
             id: resp.id,
             model: resp.model,
             content,
-            stop_reason,
+            stop_reason: stop_reason_from_anthropic(resp.stop_reason.as_deref()),
             tool_calls,
             usage: Usage {
                 input_tokens: resp.usage.input_tokens,
@@ -312,6 +308,217 @@ impl From<AnthropicMessagesResponse> for ChatResponse {
             },
             tags: Vec::new(),
         }
+    }
+}
+
+/// Shared between the non-streaming response conversion above and
+/// [`AnthropicStreamDecoder`], since both see the same `stop_reason` strings.
+fn stop_reason_from_anthropic(reason: Option<&str>) -> StopReason {
+    match reason {
+        Some("end_turn") => StopReason::EndTurn,
+        Some("max_tokens") => StopReason::MaxTokens,
+        Some("tool_use") => StopReason::ToolUse,
+        _ => StopReason::Other,
+    }
+}
+
+/// One SSE event from an Anthropic-shaped upstream streaming `/messages`,
+/// tagged by its `data:` payload's `type` (the `event:` line just repeats
+/// it). Types this router doesn't model — new event types Anthropic adds
+/// later included — deserialize to `Other` and are skipped rather than
+/// failing the stream.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicStreamEvent {
+    MessageStart {
+        message: AnthropicStreamMessage,
+    },
+    ContentBlockStart {
+        index: u32,
+        content_block: AnthropicStreamBlock,
+    },
+    ContentBlockDelta {
+        index: u32,
+        delta: AnthropicStreamDelta,
+    },
+    /// Carries nothing the canonical stream needs: every renderer closes a
+    /// block itself when the next one opens or the stream ends.
+    ContentBlockStop,
+    MessageDelta {
+        delta: AnthropicMessageDelta,
+        #[serde(default)]
+        usage: Option<AnthropicUsage>,
+    },
+    MessageStop,
+    Ping,
+    Error {
+        error: AnthropicStreamError,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// The skeleton message in `message_start`. Only its usage (input tokens) is
+/// needed — the content arrives as the blocks that follow.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnthropicStreamMessage {
+    #[serde(default)]
+    pub usage: AnthropicUsage,
+}
+
+/// The `content_block` opened by `content_block_start`. `thinking`,
+/// `redacted_thinking` and server-side tool blocks (`server_tool_use`,
+/// `web_search_tool_result`, …) are `Other` and dropped: [`StreamEvent`] has
+/// nothing to carry them in.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicStreamBlock {
+    Text {
+        #[serde(default)]
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// The `delta` of a `content_block_delta`. `thinking_delta`,
+/// `signature_delta` and `citations_delta` are `Other`, for the same reason
+/// as [`AnthropicStreamBlock::Other`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicStreamDelta {
+    TextDelta { text: String },
+    InputJsonDelta { partial_json: String },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AnthropicMessageDelta {
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+}
+
+/// An `error` event's payload, e.g. `{"type": "overloaded_error", "message":
+/// "Overloaded"}` — how Anthropic reports a failure after the `200` and
+/// first events have already gone out.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnthropicStreamError {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
+}
+
+/// Reassembles an Anthropic-shaped upstream's SSE stream into canonical
+/// [`StreamEvent`]s — the counterpart of
+/// [`super::openai::OpenAiStreamDecoder`]. Stateful for two reasons: deltas
+/// identify their content block by `index` alone, so this tracks which
+/// indices are `tool_use` blocks (and their ids); and usage and stop reason
+/// arrive split across `message_start` (input tokens) and `message_delta`
+/// (stop reason, output tokens), but are reported together in the single
+/// `Done` emitted on `message_stop`.
+#[derive(Default)]
+pub struct AnthropicStreamDecoder {
+    tool_use_ids: HashMap<u32, String>,
+    usage: Usage,
+    stop_reason: Option<String>,
+}
+
+impl AnthropicStreamDecoder {
+    /// Decodes one line of the SSE body. Only `data:` lines carry anything;
+    /// `event:` lines, blank separators and comments yield no events. An
+    /// upstream `error` event, or a `data:` payload that isn't valid JSON,
+    /// is returned as `Err`.
+    pub fn decode_line(&mut self, line: &str) -> anyhow::Result<Vec<StreamEvent>> {
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(Vec::new());
+        };
+        let event: AnthropicStreamEvent = serde_json::from_str(data.trim_start())
+            .map_err(|e| anyhow::anyhow!("parsing Anthropic stream event: {e}"))?;
+        self.decode(event)
+    }
+
+    pub fn decode(&mut self, event: AnthropicStreamEvent) -> anyhow::Result<Vec<StreamEvent>> {
+        let mut events = Vec::new();
+
+        match event {
+            AnthropicStreamEvent::MessageStart { message } => {
+                self.usage = Usage {
+                    input_tokens: message.usage.input_tokens,
+                    output_tokens: message.usage.output_tokens,
+                };
+            }
+            AnthropicStreamEvent::ContentBlockStart { index, content_block } => match content_block {
+                AnthropicStreamBlock::Text { text } => {
+                    if !text.is_empty() {
+                        events.push(StreamEvent::TextDelta { text });
+                    }
+                }
+                AnthropicStreamBlock::ToolUse { id, name, input } => {
+                    self.tool_use_ids.insert(index, id.clone());
+                    events.push(StreamEvent::ToolCallStart { id: id.clone(), name });
+                    // Anthropic itself always opens with `"input": {}` and
+                    // streams the arguments as `input_json_delta`s; some
+                    // Anthropic-compatible servers send the whole input here
+                    // instead.
+                    if input.as_object().is_some_and(|o| !o.is_empty()) {
+                        events.push(StreamEvent::ToolCallDelta { id, partial_input: input.to_string() });
+                    }
+                }
+                AnthropicStreamBlock::Other => {}
+            },
+            AnthropicStreamEvent::ContentBlockDelta { index, delta } => match delta {
+                AnthropicStreamDelta::TextDelta { text } => {
+                    if !text.is_empty() {
+                        events.push(StreamEvent::TextDelta { text });
+                    }
+                }
+                AnthropicStreamDelta::InputJsonDelta { partial_json } => {
+                    // Only for blocks opened as `tool_use` above — server-side
+                    // tool blocks stream `input_json_delta`s too, but aren't
+                    // surfaced, so theirs would otherwise land on whichever
+                    // tool call the client last saw open.
+                    if let Some(id) = self.tool_use_ids.get(&index) {
+                        if !partial_json.is_empty() {
+                            events.push(StreamEvent::ToolCallDelta { id: id.clone(), partial_input: partial_json });
+                        }
+                    }
+                }
+                AnthropicStreamDelta::Other => {}
+            },
+            AnthropicStreamEvent::MessageDelta { delta, usage } => {
+                if delta.stop_reason.is_some() {
+                    self.stop_reason = delta.stop_reason;
+                }
+                // These counts are cumulative. `input_tokens` is normally
+                // absent here (it came with `message_start`), so only a
+                // non-zero one overrides it.
+                if let Some(usage) = usage {
+                    self.usage.output_tokens = usage.output_tokens;
+                    if usage.input_tokens > 0 {
+                        self.usage.input_tokens = usage.input_tokens;
+                    }
+                }
+            }
+            AnthropicStreamEvent::MessageStop => {
+                events.push(StreamEvent::Done {
+                    stop_reason: stop_reason_from_anthropic(self.stop_reason.as_deref()),
+                    usage: self.usage.clone(),
+                });
+            }
+            AnthropicStreamEvent::Error { error } => {
+                bail!("Anthropic stream error ({}): {}", error.error_type, error.message);
+            }
+            AnthropicStreamEvent::ContentBlockStop | AnthropicStreamEvent::Ping | AnthropicStreamEvent::Other => {}
+        }
+
+        Ok(events)
     }
 }
 
@@ -751,6 +958,159 @@ mod tests {
         assert_eq!(chat.stop_reason, StopReason::ToolUse);
         assert_eq!(chat.tool_calls.len(), 1);
         assert_eq!(chat.tool_calls[0].name, "get_weather");
+    }
+
+    /// Feeds an upstream SSE body through a fresh decoder line by line, the
+    /// way `Provider::stream_anthropic` does, collecting every event.
+    fn decode_sse(sse: &str) -> anyhow::Result<Vec<StreamEvent>> {
+        let mut decoder = AnthropicStreamDecoder::default();
+        let mut events = Vec::new();
+        for line in sse.lines() {
+            events.extend(decoder.decode_line(line)?);
+        }
+        Ok(events)
+    }
+
+    #[test]
+    fn decoder_streams_text_and_reports_stop_reason_and_usage_on_message_stop() {
+        let events = decode_sse(concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}"#, "\n\n",
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+            "event: ping\n",
+            r#"data: {"type": "ping"}"#, "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#, "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}"#, "\n\n",
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":15}}"#, "\n\n",
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#, "\n\n",
+        ))
+        .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta { text: "Hello".to_string() },
+                StreamEvent::TextDelta { text: " world".to_string() },
+                StreamEvent::Done {
+                    stop_reason: StopReason::MaxTokens,
+                    usage: Usage { input_tokens: 25, output_tokens: 15 },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decoder_streams_tool_use_block_as_tool_call_start_and_argument_deltas() {
+        let events = decode_sse(concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}"#, "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Checking."}}"#, "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#, "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}"#, "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\": "}}"#, "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"Paris\"}"}}"#, "\n",
+            r#"data: {"type":"content_block_stop","index":1}"#, "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":40}}"#, "\n",
+            r#"data: {"type":"message_stop"}"#, "\n",
+        ))
+        .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta { text: "Checking.".to_string() },
+                StreamEvent::ToolCallStart { id: "toolu_1".to_string(), name: "get_weather".to_string() },
+                StreamEvent::ToolCallDelta { id: "toolu_1".to_string(), partial_input: r#"{"city": "#.to_string() },
+                StreamEvent::ToolCallDelta { id: "toolu_1".to_string(), partial_input: r#""Paris"}"#.to_string() },
+                StreamEvent::Done {
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage { input_tokens: 10, output_tokens: 40 },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decoder_emits_whole_input_when_tool_use_block_opens_with_it() {
+        let events = decode_sse(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Paris"}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallStart { id: "toolu_1".to_string(), name: "get_weather".to_string() },
+                StreamEvent::ToolCallDelta { id: "toolu_1".to_string(), partial_input: r#"{"city":"Paris"}"#.to_string() },
+            ]
+        );
+    }
+
+    #[test]
+    fn decoder_skips_thinking_and_server_tool_blocks() {
+        let events = decode_sse(concat!(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#, "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think."}}"#, "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQB"}}"#, "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#, "\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#, "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\": \"weather\"}"}}"#, "\n",
+            r#"data: {"type":"content_block_stop","index":1}"#, "\n",
+            r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#, "\n",
+            r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Sunny."}}"#, "\n",
+            r#"data: {"type":"some_future_event","detail":1}"#, "\n",
+        ))
+        .unwrap();
+
+        assert_eq!(events, vec![StreamEvent::TextDelta { text: "Sunny.".to_string() }]);
+    }
+
+    #[test]
+    fn decoder_returns_upstream_error_event_as_err() {
+        let mut decoder = AnthropicStreamDecoder::default();
+        decoder
+            .decode_line(r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#)
+            .unwrap();
+
+        assert_eq!(decoder.decode_line("event: error").unwrap(), Vec::new());
+        let err = decoder
+            .decode_line(r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Anthropic stream error (overloaded_error): Overloaded");
+    }
+
+    #[test]
+    fn decoder_rejects_malformed_data_line() {
+        let mut decoder = AnthropicStreamDecoder::default();
+        assert!(decoder.decode_line("data: {not json").is_err());
+    }
+
+    #[test]
+    fn decoder_ignores_non_data_lines_and_tolerates_no_space_after_colon() {
+        let mut decoder = AnthropicStreamDecoder::default();
+        assert_eq!(decoder.decode_line("").unwrap(), Vec::new());
+        assert_eq!(decoder.decode_line(": keep-alive comment").unwrap(), Vec::new());
+        assert_eq!(decoder.decode_line("event: content_block_delta").unwrap(), Vec::new());
+        assert_eq!(
+            decoder
+                .decode_line(r#"data:{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#)
+                .unwrap(),
+            vec![StreamEvent::TextDelta { text: "hi".to_string() }]
+        );
+    }
+
+    #[test]
+    fn decoder_reports_other_stop_reason_when_message_delta_missing() {
+        let events = decode_sse(r#"data: {"type":"message_stop"}"#).unwrap();
+        assert_eq!(events, vec![StreamEvent::Done { stop_reason: StopReason::Other, usage: Usage::default() }]);
     }
 
     fn events_stream(

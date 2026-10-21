@@ -3,7 +3,8 @@
 Each `[[providers]]` entry in `config.toml` is an upstream LLM backend.
 `src/provider.rs` translates the canonical `ChatRequest`/`ChatResponse`
 (`src/canonical.rs`) to and from whichever wire format the provider speaks,
-based on its `format`.
+based on its `format`. Every format supports both plain and streaming
+(`stream: true`) requests.
 
 ```toml
 [[providers]]
@@ -38,6 +39,22 @@ OpenAI-compatible cloud APIs such as Cloudflare Workers AI or
 
 Speaks the Anthropic Messages API: `POST {base_url}/messages` with an
 `anthropic-version` header and `x-api-key` auth from `api_key_env`.
+
+Streaming works too. A `stream: true` request is sent upstream with
+`"stream": true`, and the provider's SSE events (`content_block_delta` text
+and `input_json_delta` tool-argument deltas, `message_delta` stop reason and
+usage) are re-rendered live for whichever endpoint the client called. So
+Claude Code on `/v1/messages`, Copilot CLI on `/v1/chat/completions` and
+Codex on `/v1/responses` can all stream from a Claude model, tool calls
+included. Some things don't carry over:
+
+- Thinking blocks (and server-side tool blocks such as `server_tool_use`)
+  are dropped from the stream. The client never sees them, so it can't send
+  them back on later turns, and the model answers each turn without its
+  earlier reasoning.
+- An upstream `error` event mid-stream (e.g. `overloaded_error`) cuts off the
+  client's connection, so the client sees a failed stream rather than one
+  that looks complete.
 
 ## `format = "ollama"`
 
