@@ -8,15 +8,17 @@
 //! prompt -> classifiers -> routing -> model -> logging
 //! ```
 //!
-//! Every classifier enabled in config (via `[classifiers.<id>]`) runs, in
-//! registry order, on every request. Each produces zero or more tags, which
-//! are merged (de-duplicated) into [`ChatRequest::tags`](crate::canonical::ChatRequest::tags).
+//! Every classifier enabled in config (via `[classifiers.<id>]`) runs, all
+//! at once, on every request. Each produces zero or more tags, which are
+//! merged (de-duplicated, in registry order) into [`ChatRequest::tags`](crate::canonical::ChatRequest::tags).
 //! `routers` rules — in particular [`crate::config::RouterRule::Tag`] — can
 //! then match on those tags. A classifier can also pick the model to route
 //! to outright (see [`cev`] and [`llm`]), for a
 //! [`crate::config::RouterRule::Cev`] or [`crate::config::RouterRule::Llm`]
-//! rule to act on. A classifier that errors is logged and skipped; it never
-//! fails the request.
+//! rule to act on; every pick is kept, and the first of those rules in the
+//! chain decides. With both enabled, `llm`'s pick also labels `cev`'s
+//! decision, so cev learns from every request whichever one routes it. A
+//! classifier that errors is logged and skipped; it never fails the request.
 
 pub mod cev;
 pub mod keyword;
@@ -28,6 +30,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -53,6 +56,15 @@ impl From<Vec<String>> for Classification {
     fn from(tags: Vec<String>) -> Self {
         Classification { tags, route: None }
     }
+}
+
+/// What all the enabled classifiers concluded about a request.
+#[derive(Debug, Default)]
+pub struct Classified {
+    /// Every tag any of them gave it, de-duplicated, in registry order.
+    pub tags: Vec<String>,
+    /// Every model one of them picked, in registry order.
+    pub routes: Vec<RouteChoice>,
 }
 
 #[async_trait]
@@ -133,6 +145,8 @@ pub struct ClassifierRegistry {
     entries: Vec<ClassifierEntry>,
     /// The `cev` classifier, if enabled, for sending it feedback.
     cev: Option<Arc<cev::CevClassifier>>,
+    /// The `llm` classifier, if enabled, whose picks label cev's decisions.
+    llm: Option<Arc<llm::LlmClassifier>>,
 }
 
 impl ClassifierRegistry {
@@ -159,25 +173,15 @@ impl ClassifierRegistry {
             Some(cfg) => {
                 let classifier = llm::LlmClassifier::from_settings(&cfg.settings, &config.providers)
                     .context("configuring classifier 'llm'")?;
-                classifiers.push(Arc::new(classifier));
-                true
+                Some(Arc::new(classifier))
             }
-            None => false,
+            None => None,
         };
+        if let Some(llm) = &llm {
+            classifiers.push(llm.clone());
+        }
 
-        for (id, enabled, has_rule) in [
-            ("cev", cev.is_some(), config.routers.iter().any(|r| matches!(r, RouterRule::Cev { .. }))),
-            ("llm", llm, config.routers.iter().any(|r| matches!(r, RouterRule::Llm))),
-        ] {
-            if enabled && !has_rule {
-                tracing::warn!("classifier '{id}' is enabled, but no `type = \"{id}\"` rule in `routers` uses its picks");
-            } else if !enabled && has_rule {
-                tracing::warn!("`routers` has a `type = \"{id}\"` rule, but classifier '{id}' isn't enabled, so it never matches");
-            }
-        }
-        if cev.is_some() && llm {
-            tracing::warn!("classifiers 'cev' and 'llm' are both enabled; only cev's pick is kept, so 'llm' is asked for nothing");
-        }
+        check_routing(config, cev.as_deref(), llm.as_deref());
 
         let entries = classifiers
             .into_iter()
@@ -191,7 +195,7 @@ impl ClassifierRegistry {
             })
             .collect();
 
-        Ok(ClassifierRegistry { entries, cev })
+        Ok(ClassifierRegistry { entries, cev, llm })
     }
 
     /// The `cev` classifier, if it's enabled.
@@ -199,53 +203,124 @@ impl ClassifierRegistry {
         self.cev.as_deref()
     }
 
-    /// A registry running only `classifier`.
+    /// A registry running only `cev`, and `llm` if given.
     #[cfg(test)]
-    pub fn with_cev(classifier: cev::CevClassifier) -> Self {
-        let classifier = Arc::new(classifier);
+    pub fn with_cev(cev: cev::CevClassifier, llm: Option<llm::LlmClassifier>) -> Self {
+        let cev = Arc::new(cev);
+        let llm = llm.map(Arc::new);
+        let mut classifiers: Vec<Arc<dyn Classifier>> = vec![cev.clone()];
+        classifiers.extend(llm.clone().map(|llm| llm as Arc<dyn Classifier>));
         ClassifierRegistry {
-            entries: vec![ClassifierEntry {
-                classifier: classifier.clone(),
-                enabled: true,
-                settings: Map::new(),
-            }],
-            cev: Some(classifier),
+            entries: classifiers
+                .into_iter()
+                .map(|classifier| ClassifierEntry {
+                    classifier,
+                    enabled: true,
+                    settings: Map::new(),
+                })
+                .collect(),
+            cev: Some(cev),
+            llm,
         }
     }
 
-    /// Runs every enabled classifier over `req` and returns the de-duplicated
-    /// union of tags they produce, in registry order, along with the first
-    /// model one of them picks.
-    pub async fn classify(&self, req: &ChatRequest) -> Classification {
-        let mut merged = Classification::default();
-
-        for entry in &self.entries {
-            if !entry.enabled {
-                continue;
-            }
-
+    /// Runs every enabled classifier over `req`, all at once, and returns
+    /// the de-duplicated union of tags they produce and every model they
+    /// pick, both in registry order.
+    pub async fn classify(&self, req: &ChatRequest) -> Classified {
+        let classifications = join_all(self.entries.iter().filter(|entry| entry.enabled).map(|entry| async move {
             let ctx = ClassifierContext {
                 settings: entry.settings.clone(),
             };
+            (entry.classifier.id(), entry.classifier.classify(&ctx, req).await)
+        }))
+        .await;
 
-            match entry.classifier.classify(&ctx, req).await {
+        let mut merged = Classified::default();
+        for (id, classification) in classifications {
+            match classification {
                 Ok(classification) => {
                     for tag in classification.tags {
                         if !merged.tags.contains(&tag) {
                             merged.tags.push(tag);
                         }
                     }
-                    if merged.route.is_none() {
-                        merged.route = classification.route;
-                    }
+                    merged.routes.extend(classification.route);
                 }
                 Err(err) => {
-                    tracing::warn!("classifier '{}' failed: {err:#}", entry.classifier.id());
+                    tracing::warn!("classifier '{id}' failed: {err:#}");
                 }
             }
         }
 
+        self.label_cev_with_llm(&merged.routes);
         merged
+    }
+
+    /// Labels cev's decision about a request with llm's pick for it, if
+    /// both made one. The label is sent in the background: routing doesn't
+    /// wait for cev to learn from it.
+    fn label_cev_with_llm(&self, routes: &[RouteChoice]) {
+        let (Some(cev), Some(llm)) = (&self.cev, &self.llm) else {
+            return;
+        };
+        let decision_id = routes.iter().find(|r| r.classifier == "cev").and_then(|r| r.decision_id.clone());
+        let pick = routes.iter().find(|r| r.classifier == "llm");
+        let (Some(decision_id), Some(pick)) = (decision_id, pick) else {
+            return;
+        };
+        if !cev.learns_from_llm() {
+            return;
+        }
+
+        let (cev, llm, pick) = (cev.clone(), llm.clone(), pick.clone());
+        tokio::spawn(async move {
+            if let Err(err) = cev.learn_from_llm(&decision_id, &pick, llm.asked()).await {
+                tracing::warn!("couldn't label cev decision {decision_id} with llm's pick '{}': {err}", pick.choice);
+            }
+        });
+    }
+}
+
+/// Warns about routing classifiers and `routers` rules that don't add up:
+/// a rule for a classifier that isn't enabled, a classifier nothing uses,
+/// or `llm` picks that can't label cev's decisions.
+fn check_routing(config: &Config, cev: Option<&cev::CevClassifier>, llm: Option<&llm::LlmClassifier>) {
+    let cev_rule = config.routers.iter().any(|r| matches!(r, RouterRule::Cev { .. }));
+    let llm_rule = config.routers.iter().any(|r| matches!(r, RouterRule::Llm));
+    // Whether llm's picks label cev's decisions.
+    let teaching = llm.is_some() && cev.is_some_and(|cev| cev.learns_from_llm());
+
+    for (id, enabled, has_rule) in [("cev", cev.is_some(), cev_rule), ("llm", llm.is_some(), llm_rule)] {
+        if !enabled && has_rule {
+            tracing::warn!("`routers` has a `type = \"{id}\"` rule, but classifier '{id}' isn't enabled, so it never matches");
+        }
+    }
+    if cev.is_some() && !cev_rule {
+        let learning = if teaching { " and learn from 'llm''s picks" } else { "" };
+        tracing::info!(
+            "classifier 'cev' routes nothing (no `type = \"cev\"` rule), but still decides every request so it can take feedback{learning}"
+        );
+    }
+    if llm.is_some() && !llm_rule {
+        if teaching {
+            tracing::info!("classifier 'llm' routes nothing (no `type = \"llm\"` rule); its picks only label cev's decisions");
+        } else {
+            tracing::warn!("classifier 'llm' is enabled, but no `type = \"llm\"` rule in `routers` uses its picks");
+        }
+    }
+
+    if let (Some(cev), Some(llm), true) = (cev, llm, teaching) {
+        for option in llm.models() {
+            if cev.option_for(&option.provider, &option.model).is_none() {
+                tracing::warn!(
+                    "classifier 'llm' can pick '{}', but none of cev's `models` is {}/{}, so that pick won't label cev's decisions",
+                    option.name(),
+                    option.provider,
+                    option.model
+                );
+            }
+        }
     }
 }
 

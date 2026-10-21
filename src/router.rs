@@ -127,9 +127,9 @@ impl ModelRouter {
     /// Resolve the requested model to a provider and the model name to send
     /// it (after any `rewrite_model`). `tags` are the classifier tags
     /// assigned to this request (see [`crate::classifiers`]), consulted by
-    /// [`RouterRule::Tag`] rules; `route` is the model a classifier picked
-    /// for it, if any, consulted by [`RouterRule::Cev`] and
-    /// [`RouterRule::Llm`] rules. `needed` is
+    /// [`RouterRule::Tag`] rules; `routes` are the models classifiers picked
+    /// for it, consulted by [`RouterRule::Cev`] and [`RouterRule::Llm`]
+    /// rules, each for its own classifier's pick. `needed` is
     /// what the request structurally requires (see
     /// [`crate::canonical::ChatRequest::needed_capabilities`]); a rule whose
     /// candidate model doesn't support everything in `needed` is treated as
@@ -140,11 +140,11 @@ impl ModelRouter {
         &self,
         model: &str,
         tags: &[String],
-        route: Option<&RouteChoice>,
+        routes: &[RouteChoice],
         needed: &[String],
     ) -> Option<(&Provider, String)> {
         for rule in &self.rules {
-            if let Some((name, target_model)) = self.apply_rule(rule, model, tags, route) {
+            if let Some((name, target_model)) = self.apply_rule(rule, model, tags, routes) {
                 if !self.supports(&target_model, needed) {
                     continue;
                 }
@@ -161,7 +161,7 @@ impl ModelRouter {
         rule: &RouterRule,
         model: &str,
         tags: &[String],
-        route: Option<&RouteChoice>,
+        routes: &[RouteChoice],
     ) -> Option<(String, String)> {
         match rule {
             RouterRule::Prefix {
@@ -256,11 +256,14 @@ impl ModelRouter {
                     (name, target)
                 })
             }
-            RouterRule::Cev { min_confidence } => route
-                .filter(|route| route.classifier == "cev" && route.confidence >= *min_confidence)
+            RouterRule::Cev { min_confidence } => routes
+                .iter()
+                .find(|route| route.classifier == "cev")
+                .filter(|route| route.confidence >= *min_confidence)
                 .map(|route| (route.provider.clone(), route.model.clone())),
-            RouterRule::Llm => route
-                .filter(|route| route.classifier == "llm")
+            RouterRule::Llm => routes
+                .iter()
+                .find(|route| route.classifier == "llm")
                 .map(|route| (route.provider.clone(), route.model.clone())),
         }
     }
@@ -363,19 +366,19 @@ mod tests {
 
         // A request tagged "vision" by a classifier is routed to the
         // vision-capable provider and rewritten, regardless of `model`.
-        let (provider, model) = router.resolve("gpt-4", &["vision".to_string()], None, &[]).unwrap();
+        let (provider, model) = router.resolve("gpt-4", &["vision".to_string()], &[], &[]).unwrap();
         assert_eq!(provider.name, "vision-provider");
         assert_eq!(model, "vision-model");
 
         // Likewise for "video".
-        let (provider, model) = router.resolve("gpt-4", &["video".to_string()], None, &[]).unwrap();
+        let (provider, model) = router.resolve("gpt-4", &["video".to_string()], &[], &[]).unwrap();
         assert_eq!(provider.name, "vision-provider");
         assert_eq!(model, "video-model");
 
         // No matching tag: the `tag` rules pass through to `fallback`,
         // which picks the highest-scoring provider (here, the
         // higher-quality "vision-provider") and leaves `model` untouched.
-        let (provider, model) = router.resolve("gpt-4", &[], None, &[]).unwrap();
+        let (provider, model) = router.resolve("gpt-4", &[], &[], &[]).unwrap();
         assert_eq!(provider.name, "vision-provider");
         assert_eq!(model, "gpt-4");
     }
@@ -409,7 +412,7 @@ mod tests {
         let mut router = ModelRouter::from_config(&config).unwrap();
 
         // Before discovery has run, "discover" passes through to fallback.
-        let (provider, _) = router.resolve("llama3:8b", &[], None, &[]).unwrap();
+        let (provider, _) = router.resolve("llama3:8b", &[], &[], &[]).unwrap();
         assert_eq!(provider.name, "openai");
 
         // Simulate discovery having found "llama3:8b" on the ollama provider.
@@ -417,12 +420,12 @@ mod tests {
             .available_models
             .insert("ollama".to_string(), ["llama3:8b".to_string()].into_iter().collect());
 
-        let (provider, model) = router.resolve("llama3:8b", &[], None, &[]).unwrap();
+        let (provider, model) = router.resolve("llama3:8b", &[], &[], &[]).unwrap();
         assert_eq!(provider.name, "ollama");
         assert_eq!(model, "llama3:8b");
 
         // A model ollama doesn't report having falls through to fallback.
-        let (provider, _) = router.resolve("gpt-4", &[], None, &[]).unwrap();
+        let (provider, _) = router.resolve("gpt-4", &[], &[], &[]).unwrap();
         assert_eq!(provider.name, "openai");
     }
 
@@ -470,7 +473,7 @@ mod tests {
         // phi3:mini doesn't support vision, so the prefix rule's pick is
         // rejected; the chain falls through to fallback, whose
         // rewrite_model points at the vision-capable gemma3:latest instead.
-        let (provider, model) = router.resolve("phi3:mini", &[], None, &["vision".to_string()]).unwrap();
+        let (provider, model) = router.resolve("phi3:mini", &[], &[], &["vision".to_string()]).unwrap();
         assert_eq!(provider.name, "fallback-provider");
         assert_eq!(model, "gemma3:latest");
     }
@@ -483,7 +486,7 @@ mod tests {
             ["completion".to_string(), "vision".to_string()].into_iter().collect(),
         );
 
-        let (provider, model) = router.resolve("phi3:mini", &[], None, &["vision".to_string()]).unwrap();
+        let (provider, model) = router.resolve("phi3:mini", &[], &[], &["vision".to_string()]).unwrap();
         assert_eq!(provider.name, "ollama");
         assert_eq!(model, "phi3:mini");
     }
@@ -494,7 +497,7 @@ mod tests {
 
         // No model_capabilities entry at all for phi3:mini: permissive
         // default, routes directly even though "vision" is needed.
-        let (provider, model) = router.resolve("phi3:mini", &[], None, &["vision".to_string()]).unwrap();
+        let (provider, model) = router.resolve("phi3:mini", &[], &[], &["vision".to_string()]).unwrap();
         assert_eq!(provider.name, "ollama");
         assert_eq!(model, "phi3:mini");
     }
@@ -520,7 +523,7 @@ mod tests {
             .model_capabilities
             .insert("phi3:mini".to_string(), ["completion".to_string()].into_iter().collect());
 
-        assert!(router.resolve("phi3:mini", &[], None, &["vision".to_string()]).is_none());
+        assert!(router.resolve("phi3:mini", &[], &[], &["vision".to_string()]).is_none());
     }
 
     #[test]
@@ -568,16 +571,16 @@ mod tests {
         };
 
         // A confident pick decides both the provider and the model.
-        let (provider, model) = router.resolve("gpt-4", &[], Some(&picked(0.9)), &[]).unwrap();
+        let (provider, model) = router.resolve("gpt-4", &[], &[picked(0.9)], &[]).unwrap();
         assert_eq!(provider.name, "local");
         assert_eq!(model, "llama3.2-3b");
 
         // Below `min_confidence`, or with no pick at all, the rule passes
         // through to `fallback`.
-        let (provider, model) = router.resolve("gpt-4", &[], Some(&picked(0.4)), &[]).unwrap();
+        let (provider, model) = router.resolve("gpt-4", &[], &[picked(0.4)], &[]).unwrap();
         assert_eq!(provider.name, "ollama");
         assert_eq!(model, "gpt-4");
-        let (provider, _) = router.resolve("gpt-4", &[], None, &[]).unwrap();
+        let (provider, _) = router.resolve("gpt-4", &[], &[], &[]).unwrap();
         assert_eq!(provider.name, "ollama");
 
         // Rules earlier in the chain still win over a confident pick.
@@ -585,7 +588,7 @@ mod tests {
             provider: "ollama".to_string(),
             ..picked(0.9)
         };
-        let (provider, model) = router.resolve("local/x", &[], Some(&other), &[]).unwrap();
+        let (provider, model) = router.resolve("local/x", &[], &[other], &[]).unwrap();
         assert_eq!(provider.name, "local");
         assert_eq!(model, "local/x");
     }
@@ -630,13 +633,22 @@ mod tests {
         };
 
         // An `llm` pick passes the `cev` rule by and is taken by the `llm` one.
-        let (provider, model) = router.resolve("gpt-4", &[], Some(&picked_by("llm")), &[]).unwrap();
+        let (provider, model) = router.resolve("gpt-4", &[], &[picked_by("llm")], &[]).unwrap();
         assert_eq!(provider.name, "local");
         assert_eq!(model, "llama3.2-3b");
 
         // A pick from some other classifier matches neither.
-        let (provider, model) = router.resolve("gpt-4", &[], Some(&picked_by("other")), &[]).unwrap();
+        let (provider, model) = router.resolve("gpt-4", &[], &[picked_by("other")], &[]).unwrap();
         assert_eq!(provider.name, "ollama");
         assert_eq!(model, "gpt-4");
+
+        // With picks from both, the rule that comes first in the chain
+        // decides, whatever order the picks are in.
+        let cev = RouteChoice {
+            model: "llama3.2-1b".to_string(),
+            ..picked_by("cev")
+        };
+        let (_, model) = router.resolve("gpt-4", &[], &[picked_by("llm"), cev], &[]).unwrap();
+        assert_eq!(model, "llama3.2-1b");
     }
 }

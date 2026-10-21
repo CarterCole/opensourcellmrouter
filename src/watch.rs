@@ -104,7 +104,7 @@ fn print_entry(e: &LogEntry) {
     for tag in &e.tags {
         header.push_str(&format!("  {YELLOW}[{tag}]{RESET}"));
     }
-    if let Some(route) = &e.route {
+    for route in &e.routes {
         header.push_str(&format!("  {GREEN}{}{RESET}", route.summary()));
     }
     for plugin in &e.plugins {

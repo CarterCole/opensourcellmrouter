@@ -31,9 +31,11 @@
 //! [`ChatRequest::route`], and a [`crate::config::RouterRule::Llm`] rule
 //! routes on it.
 //!
-//! Unlike `cev`'s, a pick has no probabilities (its `confidence` is always
-//! 1) and can't be corrected through `/v1/feedback`. Every request costs a
-//! call to `provider`, and waits for it before being routed.
+//! Unlike `cev`'s, a pick has no probabilities (its `confidence` is
+//! always 1) and no decision of its own to correct through `/v1/feedback`.
+//! With `cev` enabled too, it labels cev's decision about the same request
+//! instead, which cev learns from (see [`super::cev`]). Every request costs
+//! a call to `provider`, and waits for it before being routed.
 //!
 //! Settings:
 //!
@@ -166,6 +168,16 @@ impl LlmClassifier {
         })
     }
 
+    /// The provider and model this classifier asks.
+    pub fn asked(&self) -> (&str, &str) {
+        (&self.provider.name, &self.model)
+    }
+
+    /// The options it picks between.
+    pub fn models(&self) -> &[ModelOption] {
+        &self.models
+    }
+
     /// What the model is shown of `req`: the system prompt and the latest
     /// user message, each cut to `max_chars`.
     fn message(&self, req: &ChatRequest) -> String {
@@ -249,7 +261,7 @@ impl Classifier for LlmClassifier {
             plugins: Vec::new(),
             forced_provider: None,
             tags: Vec::new(),
-            route: None,
+            routes: Vec::new(),
         };
 
         let reply = tokio::time::timeout(self.timeout, self.provider.send(&self.client, &question))
@@ -343,7 +355,9 @@ pub(crate) mod tests {
         ])
     }
 
-    fn classifier(router_url: &str) -> LlmClassifier {
+    /// Asks `router-model` at `router_url` to pick between the same models
+    /// as [`super::super::cev::tests::mock_classifier`].
+    pub(crate) fn classifier(router_url: &str) -> LlmClassifier {
         let settings = settings(json!({"provider": "router", "model": "router-model", "models": two_models()}));
         LlmClassifier::from_settings(&settings, &providers(router_url, "")).unwrap()
     }
@@ -364,7 +378,7 @@ pub(crate) mod tests {
             plugins: Vec::new(),
             forced_provider: None,
             tags: Vec::new(),
-            route: None,
+            routes: Vec::new(),
         }
     }
 

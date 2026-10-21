@@ -121,7 +121,8 @@ nsfw   = ["nsfw", "adult", "explicit", "erotic", "nude", "naked",
 # Let a model pick the route: Claude Haiku reads each request and names one
 # of the models below, and the `type = "llm"` rule (commented out under
 # routers) sends the request there. Costs a Haiku call per request.
-# See docs/classifiers.md#llm.
+# See docs/classifiers.md#llm. Enable a [classifiers.cev] as well and every
+# pick also trains cev (docs/classifiers.md#learning-from-llm).
 #
 # [classifiers.llm]
 # enabled  = true

@@ -176,9 +176,10 @@ function toggleExpand(e) {
 // A classifier's pick for a request. For cev: one button per model it chose
 // between, with the probability it gave each. Clicking a model reports it
 // as the one that should have answered, which cev learns from. An llm pick
-// has neither probabilities nor a decision to correct, so it's just named.
-function renderRoute(entry) {
-  const route = entry.route;
+// has neither probabilities nor a decision to correct, so it's just named;
+// with cev enabled too, it labels cev's decision, and cev's row says whether
+// the two agree.
+function renderRoute(entry, route) {
   const row = document.createElement('div');
   row.className = 'route';
 
@@ -194,10 +195,13 @@ function renderRoute(entry) {
     row.appendChild(status);
     return row;
   }
+  const llm = entry.routes.find(r => r.classifier === 'llm');
+  const agrees = llm && llm.provider === route.provider && llm.model === route.model;
   status.textContent = [
     Math.round(route.confidence * 100) + '% confident',
     route.adapted ? 'adapted' : '',
     used ? '' : 'not used',
+    llm ? (agrees ? 'agrees with llm' : 'llm picked ' + llm.choice) : '',
     'click the right model',
   ].filter(Boolean).join(' · ');
 
@@ -281,7 +285,7 @@ function renderEntry(entry) {
   row1.appendChild(duration);
 
   el.appendChild(row1);
-  if (entry.route) el.appendChild(renderRoute(entry));
+  for (const route of entry.routes || []) el.appendChild(renderRoute(entry, route));
 
   const body = document.createElement('div');
   body.className = 'body';

@@ -63,7 +63,7 @@ rewrite_model = "gpt-4o"
 ### `cev`
 
 Routes to the model the [`cev` classifier](classifiers.md#cev) picked for
-this request (`ChatRequest.route`): both the provider and the model name
+this request (in `ChatRequest.routes`): both the provider and the model name
 come from the pick. Passes through if there is no pick — the classifier is
 disabled, unreachable or timed out — or if its confidence is below
 `min_confidence` (default `0`; confidence runs from 0, every model equally
@@ -92,7 +92,10 @@ type = "llm"
 
 As with `cev`, rules before it win over the pick — e.g. a `prefix` rule that
 sends `claude-*` requests straight to Anthropic, so clients can still ask
-for a model by name.
+for a model by name. With both classifiers enabled, each rule acts on its
+own classifier's pick, so a `cev` rule with a `min_confidence` followed by
+an `llm` rule sends llm what cev is unsure of (see
+[learning from `llm`](classifiers.md#learning-from-llm)).
 
 ### `price`
 

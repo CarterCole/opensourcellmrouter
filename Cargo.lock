@@ -2253,6 +2253,7 @@ dependencies = [
  "cev-runtime",
  "crossterm",
  "futures-core",
+ "futures-util",
  "indexmap",
  "opentelemetry",
  "opentelemetry-appender-tracing",

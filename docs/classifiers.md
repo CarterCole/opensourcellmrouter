@@ -28,19 +28,19 @@ pub struct Classification {
 
 `classify` inspects the request (as the client sent it, before any plugin
 mutates it) and returns zero or more tags. Every classifier enabled in
-config runs, in registry order, and their tags are merged (de-duplicated,
-in order) into `ChatRequest.tags`. A classifier that returns an error is
+config runs, all at once, and their tags are merged (de-duplicated, in
+registry order) into `ChatRequest.tags`. A classifier that returns an error is
 logged as a warning and skipped — a failed classifier never fails the
 request, it just means that classifier's tags are missing.
 
 A classifier can also pick the model to route to outright, by returning a
-`route` (see [`cev`](#cev) and [`llm`](#llm)). The first one returned
-becomes `ChatRequest.route`, which a [`cev`](routers.md#cev) or
-[`llm`](routers.md#llm) router rule acts on — each only on its own
-classifier's picks.
+`route` (see [`cev`](#cev) and [`llm`](#llm)). Every pick is kept in
+`ChatRequest.routes`, and a [`cev`](routers.md#cev) or
+[`llm`](routers.md#llm) router rule acts on its own classifier's pick, so
+with both enabled the first of those rules in `routers` decides.
 
-`ChatRequest.tags` and `ChatRequest.route` are not forwarded to providers,
-but are recorded in the request log (`tags` and `route` fields) alongside
+`ChatRequest.tags` and `ChatRequest.routes` are not forwarded to providers,
+but are recorded in the request log (`tags` and `routes` fields) alongside
 the plugin ids that ran.
 
 ## Enabling a classifier
@@ -117,6 +117,7 @@ chain decides which rules can override it.
 | `task` | `llmrouter.route` | Key of the online adapter that learns from feedback. |
 | `timeout_ms` | `5000` | How long to wait for cev before routing without it. |
 | `max_chars` | `2000` | How much of the system prompt and of the message to send. |
+| `llm_label_weight` | `1.0` | Weight of a label taken from an [`llm`](#llm) pick, against 1 for a correction. `0` takes none. See [learning from `llm`](#learning-from-llm). |
 
 Each of `models` has a `provider` and `model` to route to, an optional
 `description` of what the model is good at (cev sees it next to the name),
@@ -152,6 +153,60 @@ adapter for `task` straight away; it starts serving the adapter once it has
 8 labels and predicts them better than the base model does. The response
 says where that stands (`task_examples`, `adapter_active`). Labelling the
 model that was picked confirms it, which is as useful as a correction.
+
+cev decides every request whether or not its pick routes it — with no
+`cev` rule in `routers`, or one whose `min_confidence` it falls short of,
+or another rule ahead of it — so every request still has a decision id to
+correct.
+
+#### Learning from `llm`
+
+With the [`llm` classifier](#llm) enabled too, both run on every request,
+and llm's pick becomes the label for cev's decision about the same
+request. cev learns from it as it would from a correction, so it trains on
+every request without anyone clicking anything, and once it predicts the
+LLM well it can take over the routing. Which classifier routes is up to
+`routers`:
+
+```toml
+# llm routes; cev only learns.
+[[routers]]
+type = "llm"
+
+# Or: cev routes what it's sure of and llm the rest. llm is still asked
+# about every request, and labels all of them.
+[[routers]]
+type = "cev"
+min_confidence = 0.8
+
+[[routers]]
+type = "llm"
+```
+
+An llm pick labels the cev option with the same `provider` and `model`, so
+the two lists of `models` can name and describe them differently but should
+route to the same places; the router warns at startup about an llm option
+cev has no match for, whose picks label nothing. Labels go to cev in the
+background, so routing doesn't wait for them.
+
+A correction sent to `/v1/feedback` (or clicked on the dashboard, which
+shows whether cev agreed with llm) replaces llm's label in what cev learns
+from. cev keeps both with the decision, each with a `metadata.source` of
+`"llm"` (plus the `provider` and `model` that were asked) or `"feedback"`,
+which makes the decisions a training set for cev itself. Its export has a
+row per labeled decision: the exact prompt cev saw, what it answered, and
+the latest label, so the correction where there is one:
+
+```bash
+curl 'localhost:8081/v1/export?task=llmrouter.route' > labels.jsonl
+```
+
+Filter on `metadata.source` to train on corrections alone. Every label a
+decision has is at `GET /v1/decisions/<id>` on the cev server.
+
+`llm_label_weight` sets how much an llm label counts against a correction's
+1; set it to `0` to have cev learn only from corrections. With `model`
+instead of `url`, the same decisions and labels are in the `db` file.
 
 ### `llm`
 
@@ -203,9 +258,11 @@ doesn't name exactly one option, the call fails, or it takes longer than
 **Compared with `cev`.** No second server or GPU, and the judgment of
 whichever model you pick — but every request waits for a full chat
 completion (and, for a cloud model, pays for one) before it's routed. A pick
-has no probabilities (`confidence` is always 1), and can't be corrected:
-there's no decision id, so no `x-cev-*` headers and no `/v1/feedback`. With
-both classifiers enabled only `cev`'s pick is kept, so enable one.
+has no probabilities (`confidence` is always 1), and no decision id of its
+own, so on its own there are no `x-cev-*` headers and nothing to correct.
+Enable `cev` alongside it and each llm pick
+[labels cev's decision](#learning-from-llm) instead, which cev learns from
+while llm keeps routing; corrections then go to cev's decision.
 
 Both classify each request on its own: the latest user message that has
 text (so an agent's tool-result turns are classified by what the user last

@@ -579,7 +579,7 @@ fn entry_to_list_item(e: &LogEntry) -> ListItem<'static> {
         header.push(Span::raw("  "));
         header.push(Span::styled(format!("[{tag}]"), Style::default().fg(Color::Yellow)));
     }
-    if let Some(route) = &e.route {
+    for route in &e.routes {
         header.push(Span::raw("  "));
         header.push(Span::styled(route.summary(), Style::default().fg(Color::Green)));
     }

@@ -121,12 +121,13 @@ pub struct ChatRequest {
     /// [`crate::config::RouterRule::Tag`]. Not forwarded to providers.
     #[serde(default, skip_serializing)]
     pub tags: Vec<String>,
-    /// The model a classifier picked for this request, if one did (see
-    /// [`crate::classifiers::cev`] and [`crate::classifiers::llm`]).
-    /// Consumed by [`crate::config::RouterRule::Cev`] and
+    /// The model each routing classifier picked for this request, at most
+    /// one per classifier (see [`crate::classifiers::cev`] and
+    /// [`crate::classifiers::llm`]). Consumed by
+    /// [`crate::config::RouterRule::Cev`] and
     /// [`crate::config::RouterRule::Llm`]. Not forwarded to providers.
     #[serde(default, skip_serializing)]
-    pub route: Option<RouteChoice>,
+    pub routes: Vec<RouteChoice>,
 }
 
 /// A classifier's pick of which model should answer a request.
@@ -136,8 +137,8 @@ pub struct RouteChoice {
     pub classifier: String,
     /// Id of the `cev` decision behind this pick. Send it to
     /// `POST /v1/feedback` with the model that should have been picked to
-    /// correct (or confirm) it. `None` for `llm` picks, which can't be
-    /// corrected.
+    /// correct (or confirm) it. `None` for `llm` picks, which have no
+    /// decision of their own; with `cev` enabled too, they label cev's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_id: Option<String>,
     /// Name of the option that was picked.
@@ -392,7 +393,7 @@ mod tests {
             plugins: Vec::new(),
             forced_provider: None,
             tags: Vec::new(),
-            route: None,
+            routes: Vec::new(),
         }
     }
 

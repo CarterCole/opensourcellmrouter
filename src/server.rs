@@ -304,9 +304,9 @@ struct DispatchOutcome {
     provider: String,
     /// Model name actually sent to that provider (after any `rewrite_model`).
     model: String,
-    /// The model a classifier picked for the request, if one did (see
+    /// The models classifiers picked for the request (see
     /// [`crate::classifiers::cev`] and [`crate::classifiers::llm`]).
-    route: Option<RouteChoice>,
+    routes: Vec<RouteChoice>,
 }
 
 /// Runs the full pipeline for one request:
@@ -348,9 +348,9 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
     let mut provider_name = "plugin".to_string();
 
     if run_stage(&resolved_plugins, &state.client, Stage::Start, &mut req, &mut resp, &mut active_plugins).await? == Flow::Continue {
-        let classification = state.classifiers.classify(&req).await;
-        req.tags = classification.tags;
-        req.route = classification.route;
+        let classified = state.classifiers.classify(&req).await;
+        req.tags = classified.tags;
+        req.routes = classified.routes;
         tracing::Span::current().record("tags", format!("{:?}", req.tags));
         broadcast(state, &RouterEvent::Classified {
             id,
@@ -372,7 +372,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
                 }
                 None => state
                     .router
-                    .resolve(&req.model, &req.tags, req.route.as_ref(), &req.needed_capabilities())
+                    .resolve(&req.model, &req.tags, &req.routes, &req.needed_capabilities())
                     .ok_or_else(|| ApiError::NoProvider(req.model.clone()))?,
             };
 
@@ -403,7 +403,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
                             sent_model,
                             duration_ms: duration.as_millis() as u64,
                             tags: req.tags,
-                            route: req.route,
+                            routes: req.routes,
                             plugins: active_plugins,
                             system: req.system,
                             messages: req.messages,
@@ -429,7 +429,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
     }
 
     let request_tags = req.tags.clone();
-    let route = req.route.clone();
+    let routes = req.routes.clone();
     let provider = provider_name.clone();
     let model = sent_model.clone();
     let duration = started.elapsed();
@@ -443,7 +443,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
             sent_model,
             duration_ms: duration.as_millis() as u64,
             tags: req.tags,
-            route: req.route,
+            routes: req.routes,
             plugins: active_plugins,
             system: req.system,
             messages: req.messages,
@@ -458,7 +458,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
         request_tags,
         provider,
         model,
-        route,
+        routes,
     })
 }
 
@@ -526,10 +526,10 @@ const X_CEV_DECISION_ID: &str = "x-cev-decision-id";
 const X_CEV_CHOICE: &str = "x-cev-choice";
 
 /// Sets [`X_CEV_DECISION_ID`] and [`X_CEV_CHOICE`] when the `cev`
-/// classifier picked the model for this request; omitted otherwise
-/// (including for `llm` picks, which have no decision to correct).
-fn apply_route_headers(response: &mut Response, route: Option<&RouteChoice>) {
-    if let Some(route) = route {
+/// classifier decided this request, whether or not its pick routed it;
+/// omitted otherwise (an `llm` pick has no decision of its own).
+fn apply_route_headers(response: &mut Response, routes: &[RouteChoice]) {
+    for route in routes {
         if let Some(decision_id) = &route.decision_id {
             apply_header(response, X_CEV_DECISION_ID, decision_id);
             apply_header(response, X_CEV_CHOICE, &route.choice);
@@ -564,7 +564,7 @@ async fn chat_completions(
                 let usage = outcome.response.usage.clone();
                 let mut response = Json(openai::OpenAiChatResponse::from(outcome.response)).into_response();
                 apply_router_headers(&mut response, &outcome.request_tags, &response_tags, &outcome.provider, &outcome.model, &usage);
-                apply_route_headers(&mut response, outcome.route.as_ref());
+                apply_route_headers(&mut response, &outcome.routes);
                 response
             }
             Err(e) => e.into_response(),
@@ -598,9 +598,9 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
     });
 
     // Classify + route without running plugins.
-    let classification = state.classifiers.classify(&req).await;
-    req.tags = classification.tags;
-    req.route = classification.route;
+    let classified = state.classifiers.classify(&req).await;
+    req.tags = classified.tags;
+    req.routes = classified.routes;
     tracing::Span::current().record("tags", format!("{:?}", req.tags));
     broadcast(&state, &RouterEvent::Classified {
         id,
@@ -608,7 +608,7 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
         tags: req.tags.clone(),
     });
 
-    let (provider, target_model) = match state.router.resolve(&req.model, &req.tags, req.route.as_ref(), &req.needed_capabilities()) {
+    let (provider, target_model) = match state.router.resolve(&req.model, &req.tags, &req.routes, &req.needed_capabilities()) {
         Some(p) => p,
         None => {
             state.in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -619,7 +619,7 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
     let provider_name = provider.name.clone();
     let sent_model = target_model.clone();
     let tags = req.tags.clone();
-    let route = req.route.clone();
+    let routes = req.routes.clone();
     tracing::Span::current().record("provider", &provider_name);
     tracing::Span::current().record("model", &sent_model);
     broadcast(&state, &RouterEvent::Routed {
@@ -675,7 +675,7 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
                     sent_model,
                     duration_ms: duration.as_millis() as u64,
                     tags,
-                    route: req.route,
+                    routes: req.routes,
                     plugins: Vec::new(),
                     system: req.system,
                     messages: req.messages,
@@ -695,7 +695,7 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
         .header(header::CONNECTION, "keep-alive")
         .body(body)
         .unwrap();
-    apply_route_headers(&mut response, route.as_ref());
+    apply_route_headers(&mut response, &routes);
     response
 }
 
@@ -713,7 +713,7 @@ async fn messages(
                 let usage = outcome.response.usage.clone();
                 let mut response = Json(anthropic::AnthropicMessagesResponse::from(outcome.response)).into_response();
                 apply_router_headers(&mut response, &outcome.request_tags, &response_tags, &outcome.provider, &outcome.model, &usage);
-                apply_route_headers(&mut response, outcome.route.as_ref());
+                apply_route_headers(&mut response, &outcome.routes);
                 response
             }
             Err(e) => e.into_response(),
@@ -735,7 +735,7 @@ async fn responses_endpoint(
                 let usage = outcome.response.usage.clone();
                 let mut response = Json(responses::ResponsesResponse::from(outcome.response)).into_response();
                 apply_router_headers(&mut response, &outcome.request_tags, &response_tags, &outcome.provider, &outcome.model, &usage);
-                apply_route_headers(&mut response, outcome.route.as_ref());
+                apply_route_headers(&mut response, &outcome.routes);
                 response
             }
             Err(e) => e.into_response(),
@@ -777,8 +777,8 @@ async fn feedback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classifiers::cev::tests::mock_classifier;
-    use crate::classifiers::llm::tests::mock_provider;
+    use crate::classifiers::cev::tests::{mock_classifier, mock_classifier_and_runtime};
+    use crate::classifiers::llm::tests::{classifier as llm_classifier, mock_provider};
     use crate::config::Config;
 
     fn header_value<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
@@ -861,10 +861,10 @@ mod tests {
         url
     }
 
-    #[tokio::test]
-    async fn cev_pick_routes_the_request_and_takes_feedback() {
-        // A provider that answers with the name of the model it was asked for.
-        let provider = serve(AxumRouter::new().route(
+    /// Serves a provider that answers with the name of the model it was
+    /// asked for, and returns its base URL.
+    async fn echo_model_provider() -> String {
+        serve(AxumRouter::new().route(
             "/v1/chat/completions",
             post(|Json(body): Json<Value>| async move {
                 Json(json!({
@@ -879,7 +879,22 @@ mod tests {
                 }))
             }),
         ))
-        .await;
+        .await
+    }
+
+    /// Waits for the `complete` event on the dashboard feed.
+    async fn completed(logged: &mut broadcast::Receiver<Arc<str>>) -> Value {
+        loop {
+            let event: Value = serde_json::from_str(&logged.recv().await.unwrap()).unwrap();
+            if event["type"] == "complete" {
+                break event;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cev_pick_routes_the_request_and_takes_feedback() {
+        let provider = echo_model_provider().await;
 
         let config: Config = toml::from_str(&format!(
             r#"
@@ -903,7 +918,7 @@ mod tests {
             client: reqwest::Client::new(),
             logger: None,
             plugins: Arc::new(PluginRegistry::from_config(&config)),
-            classifiers: Arc::new(ClassifierRegistry::with_cev(mock_classifier())),
+            classifiers: Arc::new(ClassifierRegistry::with_cev(mock_classifier(), None)),
             response_classifiers: Arc::new(ResponseClassifierRegistry::from_config(&config)),
             events,
             in_flight: Arc::new(AtomicU64::new(0)),
@@ -931,15 +946,10 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "deepseek-r1:latest");
 
         // The same decision is in the request log, for the dashboard.
-        let entry = loop {
-            let event: Value = serde_json::from_str(&logged.recv().await.unwrap()).unwrap();
-            if event["type"] == "complete" {
-                break event;
-            }
-        };
+        let entry = completed(&mut logged).await;
         assert_eq!(entry["sent_model"], "deepseek-r1:latest");
-        assert_eq!(entry["route"]["decision_id"], decision_id.as_str());
-        assert_eq!(entry["route"]["choice"], "deepseek-r1:latest");
+        assert_eq!(entry["routes"][0]["decision_id"], decision_id.as_str());
+        assert_eq!(entry["routes"][0]["choice"], "deepseek-r1:latest");
 
         // Correcting it by decision id reaches cev, which learns from it.
         let correct = |label: &'static str| {
@@ -959,6 +969,92 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let error: Value = resp.json().await.unwrap();
         assert_eq!(error["error"]["type"], "router_error");
+    }
+
+    #[tokio::test]
+    async fn llm_pick_routes_the_request_and_labels_cevs_decision() {
+        let provider = echo_model_provider().await;
+        // The `llm` classifier asks a model that always says "general".
+        let (asked, _) = mock_provider("general").await;
+
+        let config: Config = toml::from_str(&format!(
+            r#"
+            [[providers]]
+            name = "ollama"
+            format = "openai"
+            base_url = "{provider}/v1"
+
+            [[routers]]
+            type = "llm"
+
+            [[routers]]
+            type = "fallback"
+            "#
+        ))
+        .unwrap();
+
+        let (cev, runtime) = mock_classifier_and_runtime();
+        let (events, mut logged) = broadcast::channel(8);
+        let state = AppState {
+            router: Arc::new(ModelRouter::from_config(&config).unwrap()),
+            client: reqwest::Client::new(),
+            logger: None,
+            plugins: Arc::new(PluginRegistry::from_config(&config)),
+            classifiers: Arc::new(ClassifierRegistry::with_cev(cev, Some(llm_classifier(&asked)))),
+            response_classifiers: Arc::new(ResponseClassifierRegistry::from_config(&config)),
+            events,
+            in_flight: Arc::new(AtomicU64::new(0)),
+            next_id: Arc::new(AtomicU64::new(0)),
+            api_key: None,
+        };
+        let router = serve(build_app(state, false)).await;
+        let client = reqwest::Client::new();
+
+        // cev would pick the coding model, but the `llm` rule routes on
+        // llm's pick. cev's decision still comes back, to be corrected.
+        let resp = client
+            .post(format!("{router}/v1/chat/completions"))
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Help me with debugging these algorithms"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[X_ROUTER_MODEL], "llama3.1:8b");
+        assert_eq!(resp.headers()[X_CEV_CHOICE], "deepseek-r1:latest");
+        let decision_id = resp.headers()[X_CEV_DECISION_ID].to_str().unwrap().to_string();
+
+        // Both picks are in the request log.
+        let entry = completed(&mut logged).await;
+        let picks: Vec<_> = entry["routes"].as_array().unwrap().iter().map(|r| (&r["classifier"], &r["choice"])).collect();
+        assert_eq!(picks, [(&json!("cev"), &json!("deepseek-r1:latest")), (&json!("llm"), &json!("general"))]);
+
+        // llm's pick labels cev's decision, in the background.
+        let mut labels = Vec::new();
+        for _ in 0..100 {
+            labels = runtime.decision(&decision_id).unwrap().unwrap().1;
+            if !labels.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(labels.len(), 1, "no label from llm's pick");
+        assert_eq!(serde_json::to_value(&labels[0].label).unwrap(), "general");
+        assert_eq!(labels[0].metadata, Some(json!({"source": "llm", "provider": "router", "model": "router-model"})));
+
+        // A correction replaces it.
+        let resp = client
+            .post(format!("{router}/v1/feedback"))
+            .json(&json!({"decision_id": decision_id, "label": "deepseek-r1:latest"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let learned: Value = resp.json().await.unwrap();
+        assert_eq!(learned["learned"], true);
+        assert_eq!(learned["task_examples"], 2);
     }
 
     #[tokio::test]
@@ -1036,14 +1132,9 @@ mod tests {
         assert!(resp.headers().get(X_CEV_DECISION_ID).is_none());
         assert_eq!(received.lock().unwrap()[0]["model"], "llama3.1:8b");
 
-        let entry = loop {
-            let event: Value = serde_json::from_str(&logged.recv().await.unwrap()).unwrap();
-            if event["type"] == "complete" {
-                break event;
-            }
-        };
-        assert_eq!(entry["route"]["classifier"], "llm");
-        assert_eq!(entry["route"]["choice"], "general");
+        let entry = completed(&mut logged).await;
+        assert_eq!(entry["routes"][0]["classifier"], "llm");
+        assert_eq!(entry["routes"][0]["choice"], "general");
     }
 
     /// An upstream Anthropic streaming reply that says something, then calls

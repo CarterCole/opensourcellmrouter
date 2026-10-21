@@ -261,7 +261,7 @@ impl From<AnthropicMessagesRequest> for ChatRequest {
             plugins: req.plugins,
             forced_provider: None,
             tags: Vec::new(),
-            route: None,
+            routes: Vec::new(),
         }
     }
 }
@@ -780,7 +780,7 @@ mod tests {
             plugins: Vec::new(),
             forced_provider: None,
             tags: Vec::new(),
-            route: None,
+            routes: Vec::new(),
         }
     }
 

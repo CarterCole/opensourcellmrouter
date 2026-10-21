@@ -15,7 +15,7 @@ Start → classifiers → PreRouting → routers → provider → PostResponse �
    the client sent it — before classifiers see it.
 2. **[Classifiers](classifiers.md)** inspect the request and attach tags
    (e.g. `"vision"`, `"nsfw"`) to `ChatRequest.tags`. The `cev` and `llm`
-   classifiers instead pick the model to route to (`ChatRequest.route`).
+   classifiers instead pick the model to route to (`ChatRequest.routes`).
 3. **Plugins** `pre_request` hooks run next, in config/request order. They
    can mutate the request (inject context, force a provider via
    `forced_provider`, etc).

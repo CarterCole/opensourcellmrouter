@@ -30,6 +30,7 @@ cev-model = { version = "0.1.0", optional = true }
 cev-rs = "0.1.0"
 cev-runtime = { version = "0.1.0", optional = true }
 futures-core = "0.3.32"
+futures-util = "0.3.32"
 indexmap = { version = "2", features = ["serde"] }
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
 ratatui = "0.29"
