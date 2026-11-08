@@ -64,20 +64,12 @@ pub enum RouterRule {
     /// Matches if the request's `model` starts with `model_prefix`, and
     /// routes to `provider`. If `rewrite_model` is set, it replaces `model`
     /// before forwarding.
-    Prefix {
-        model_prefix: String,
-        provider: String,
-        rewrite_model: Option<String>,
-    },
+    Prefix { model_prefix: String, provider: String, rewrite_model: Option<String> },
     /// Matches if `tag` is among the tags assigned by
     /// [`crate::classifiers`] (e.g. `"vision"`, `"nsfw"`, `"tools"`), and
     /// routes to `provider`. If `rewrite_model` is set, it replaces `model`
     /// before forwarding.
-    Tag {
-        tag: String,
-        provider: String,
-        rewrite_model: Option<String>,
-    },
+    Tag { tag: String, provider: String, rewrite_model: Option<String> },
     /// Picks the candidate with the lowest `cost_per_1m_tokens`. If
     /// `max_cost_per_1m_tokens` is set, candidates above it are excluded;
     /// if that leaves no candidates, this rule passes through.
@@ -172,10 +164,7 @@ pub struct LoggingConfig {
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        LoggingConfig {
-            enabled: false,
-            path: "logs/requests.jsonl".to_string(),
-        }
+        LoggingConfig { enabled: false, path: "logs/requests.jsonl".to_string() }
     }
 }
 
@@ -226,12 +215,7 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: 8090,
-            dashboard: false,
-            api_key_env: None,
-        }
+        ServerConfig { host: "127.0.0.1".to_string(), port: 8090, dashboard: false, api_key_env: None }
     }
 }
 
@@ -272,8 +256,7 @@ pub struct ProviderConfig {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config file {}", path.display()))?;
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading config file {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing config file {}", path.display()))
     }
 }

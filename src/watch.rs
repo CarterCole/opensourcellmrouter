@@ -56,15 +56,8 @@ pub async fn run(base_url: &str) -> anyhow::Result<()> {
                 match serde_json::from_str::<RouterEvent>(data) {
                     Ok(RouterEvent::Start { id: _, ts_ms, model, in_flight }) => {
                         let secs = ts_ms / 1000;
-                        let time = format!(
-                            "{:02}:{:02}:{:02}",
-                            (secs / 3600) % 24,
-                            (secs / 60) % 60,
-                            secs % 60,
-                        );
-                        println!(
-                            "{DIM}{time}  ⋯  {RESET}{BLUE}{model}{RESET}{DIM}  ({in_flight} in flight){RESET}"
-                        );
+                        let time = format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60,);
+                        println!("{DIM}{time}  ⋯  {RESET}{BLUE}{model}{RESET}{DIM}  ({in_flight} in flight){RESET}");
                     }
                     Ok(RouterEvent::Classified { id: _, ts_ms: _, tags }) if !tags.is_empty() => {
                         let tag_str = tags.join(", ");
@@ -93,10 +86,7 @@ fn print_entry(e: &LogEntry) {
     let mut header = format!("{DIM}{time}{RESET}  {BOLD}{CYAN}{}{RESET}", e.provider);
 
     if e.requested_model != e.sent_model {
-        header.push_str(&format!(
-            "  {DIM}{}{RESET} {DIM}→{RESET} {BLUE}{}{RESET}",
-            e.requested_model, e.sent_model
-        ));
+        header.push_str(&format!("  {DIM}{}{RESET} {DIM}→{RESET} {BLUE}{}{RESET}", e.requested_model, e.sent_model));
     } else {
         header.push_str(&format!("  {BLUE}{}{RESET}", e.sent_model));
     }
@@ -121,13 +111,8 @@ fn print_entry(e: &LogEntry) {
 
     println!("{header}");
 
-    let last_user = e
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == Role::User)
-        .map(|m| m.text_content())
-        .unwrap_or_default();
+    let last_user =
+        e.messages.iter().rev().find(|m| m.role == Role::User).map(|m| m.text_content()).unwrap_or_default();
     println!("  {DIM}prompt:{RESET}  {}", truncate(&last_user, 120));
 
     if let Some(err) = &e.error {

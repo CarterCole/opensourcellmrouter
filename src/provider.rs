@@ -1,6 +1,6 @@
 //! A configured upstream LLM backend, and the logic to call it.
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use reqwest::{Client, RequestBuilder};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -40,10 +40,7 @@ impl Provider {
         match &self.api_key_env {
             Some(var) => {
                 let key = std::env::var(var).with_context(|| {
-                    format!(
-                        "provider '{}' has api_key_env = \"{}\" but that variable is not set",
-                        self.name, var
-                    )
+                    format!("provider '{}' has api_key_env = \"{}\" but that variable is not set", self.name, var)
                 })?;
                 Ok(Some(key))
             }
@@ -103,7 +100,10 @@ impl Provider {
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = match chunk {
                     Ok(b) => b,
-                    Err(e) => { tx.send(Err(anyhow::anyhow!(e))).await.ok(); return; }
+                    Err(e) => {
+                        tx.send(Err(anyhow::anyhow!(e))).await.ok();
+                        return;
+                    }
                 };
                 buf.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -124,7 +124,9 @@ impl Provider {
                     };
 
                     for event in decoder.decode(chunk_resp) {
-                        if tx.send(Ok(event)).await.is_err() { return; }
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -161,7 +163,10 @@ impl Provider {
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = match chunk {
                     Ok(b) => b,
-                    Err(e) => { tx.send(Err(anyhow::anyhow!(e))).await.ok(); return; }
+                    Err(e) => {
+                        tx.send(Err(anyhow::anyhow!(e))).await.ok();
+                        return;
+                    }
                 };
                 buf.extend_from_slice(&bytes);
 
@@ -176,7 +181,9 @@ impl Provider {
 
                     for event in events {
                         let done = matches!(event, StreamEvent::Done { .. });
-                        if tx.send(Ok(event)).await.is_err() || done { return; }
+                        if tx.send(Ok(event)).await.is_err() || done {
+                            return;
+                        }
                     }
                 }
             }
@@ -219,14 +226,19 @@ impl Provider {
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = match chunk {
                     Ok(b) => b,
-                    Err(e) => { tx.send(Err(anyhow::anyhow!(e))).await.ok(); return; }
+                    Err(e) => {
+                        tx.send(Err(anyhow::anyhow!(e))).await.ok();
+                        return;
+                    }
                 };
                 buf.push_str(&String::from_utf8_lossy(&bytes));
 
                 while let Some(nl) = buf.find('\n') {
                     let line = buf[..nl].trim().to_owned();
                     buf.drain(..=nl);
-                    if line.is_empty() { continue; }
+                    if line.is_empty() {
+                        continue;
+                    }
 
                     let chunk_resp: ollama::OllamaChatResponse = match serde_json::from_str(&line) {
                         Ok(r) => r,
@@ -238,7 +250,9 @@ impl Provider {
 
                     if !chunk_resp.message.content.is_empty() {
                         let event = StreamEvent::TextDelta { text: chunk_resp.message.content };
-                        if tx.send(Ok(event)).await.is_err() { return; }
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
                     }
 
                     if chunk_resp.done {
@@ -318,8 +332,9 @@ impl Provider {
             bail!("provider '{}' returned {} fetching capabilities for '{model}': {}", self.name, status, text);
         }
 
-        let parsed: ollama::OllamaShowResponse = serde_json::from_str(&text)
-            .with_context(|| format!("parsing capabilities for model '{model}' from provider '{}': {}", self.name, text))?;
+        let parsed: ollama::OllamaShowResponse = serde_json::from_str(&text).with_context(|| {
+            format!("parsing capabilities for model '{model}' from provider '{}': {}", self.name, text)
+        })?;
 
         let mut capabilities = parsed.capabilities;
         capabilities.extend(ollama::implicit_capabilities(model, &parsed.details.family));
@@ -359,10 +374,7 @@ impl Provider {
         let body = anthropic::AnthropicMessagesRequest::from(req);
         let url = format!("{}/messages", self.base_url);
 
-        let mut rb = client
-            .post(&url)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body);
+        let mut rb = client.post(&url).header("anthropic-version", "2023-06-01").json(&body);
         if let Some(beta) = anthropic_beta_header(req) {
             rb = rb.header("anthropic-beta", beta);
         }
@@ -420,11 +432,7 @@ impl Provider {
 /// fields, or `None` if the request uses no beta features. Currently only
 /// `task_budget` is beta-gated — `thinking`/`effort` need no header.
 fn anthropic_beta_header(req: &ChatRequest) -> Option<&'static str> {
-    if req.task_budget.is_some() {
-        Some("task-budgets-2026-03-13")
-    } else {
-        None
-    }
+    if req.task_budget.is_some() { Some("task-budgets-2026-03-13") } else { None }
 }
 
 /// Removes every complete `\n`-terminated line from the front of `buf` and

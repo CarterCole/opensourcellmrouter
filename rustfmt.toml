@@ -1,0 +1,5 @@
+# The code is written wider than rustfmt's default 100 columns, and puts
+# short calls, chains and struct literals on one line. These two settings
+# match it with about half the reformatting the defaults would need.
+max_width = 120
+use_small_heuristics = "Max"

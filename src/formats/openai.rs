@@ -15,8 +15,8 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::canonical::{
-    ChatRequest, ChatResponse, ContentPart, Message, PluginRequest, Role, StopReason, StreamEvent,
-    Tool, ToolCall, Usage,
+    ChatRequest, ChatResponse, ContentPart, Message, PluginRequest, Role, StopReason, StreamEvent, Tool, ToolCall,
+    Usage,
 };
 
 /// OpenAI message content: either a bare string, or an array of typed
@@ -195,23 +195,19 @@ fn content_parts_from_openai(content: Option<OpenAiContent>) -> Vec<ContentPart>
             .into_iter()
             .filter_map(|block| match block {
                 OpenAiContentBlock::Text { text } => Some(ContentPart::Text { text }),
-                OpenAiContentBlock::ImageUrl { image_url } => parse_data_url(&image_url.url)
-                    .map(|(media_type, data)| ContentPart::Image { media_type, data }),
-                OpenAiContentBlock::InputAudio { input_audio } => Some(ContentPart::Audio {
-                    format: input_audio.format,
-                    data: input_audio.data,
-                }),
+                OpenAiContentBlock::ImageUrl { image_url } => {
+                    parse_data_url(&image_url.url).map(|(media_type, data)| ContentPart::Image { media_type, data })
+                }
+                OpenAiContentBlock::InputAudio { input_audio } => {
+                    Some(ContentPart::Audio { format: input_audio.format, data: input_audio.data })
+                }
             })
             .collect(),
     }
 }
 
 fn openai_content_to_text(content: Option<OpenAiContent>) -> String {
-    Message {
-        role: Role::User,
-        content: content_parts_from_openai(content),
-    }
-    .text_content()
+    Message { role: Role::User, content: content_parts_from_openai(content) }.text_content()
 }
 
 /// Renders one canonical [`Message`] as one or more [`OpenAiMessage`]s — a
@@ -250,10 +246,7 @@ fn openai_messages_from_canonical(msg: &Message) -> Vec<OpenAiMessage> {
             ContentPart::ToolUse { id, name, input } => tool_calls.push(OpenAiToolCall {
                 id: id.clone(),
                 call_type: "function".to_string(),
-                function: OpenAiFunctionCall {
-                    name: name.clone(),
-                    arguments: input.to_string(),
-                },
+                function: OpenAiFunctionCall { name: name.clone(), arguments: input.to_string() },
             }),
             ContentPart::ToolResult { tool_use_id, content } => {
                 tool_results.push((tool_use_id.clone(), content.clone()));
@@ -300,13 +293,8 @@ impl From<OpenAiChatRequest> for ChatRequest {
                 "assistant" => {
                     let mut content = content_parts_from_openai(msg.content);
                     for tc in msg.tool_calls.into_iter().flatten() {
-                        let input = serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or(serde_json::Value::Null);
-                        content.push(ContentPart::ToolUse {
-                            id: tc.id,
-                            name: tc.function.name,
-                            input,
-                        });
+                        let input = serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
+                        content.push(ContentPart::ToolUse { id: tc.id, name: tc.function.name, input });
                     }
                     messages.push(Message { role: Role::Assistant, content });
                 }
@@ -318,17 +306,12 @@ impl From<OpenAiChatRequest> for ChatRequest {
                     }],
                 }),
                 // Treat anything else (user, ...) as a user turn.
-                _ => messages.push(Message {
-                    role: Role::User,
-                    content: content_parts_from_openai(msg.content),
-                }),
+                _ => messages.push(Message { role: Role::User, content: content_parts_from_openai(msg.content) }),
             }
         }
 
-        let output_schema = req
-            .response_format
-            .filter(|f| f.format_type == "json_schema")
-            .map(|f| f.json_schema.schema);
+        let output_schema =
+            req.response_format.filter(|f| f.format_type == "json_schema").map(|f| f.json_schema.schema);
 
         let tools = req
             .tools
@@ -375,11 +358,7 @@ impl From<&ChatRequest> for OpenAiChatRequest {
 
         let response_format = req.output_schema.clone().map(|schema| ResponseFormat {
             format_type: "json_schema".to_string(),
-            json_schema: JsonSchemaFormat {
-                name: default_schema_name(),
-                schema,
-                strict: true,
-            },
+            json_schema: JsonSchemaFormat { name: default_schema_name(), schema, strict: true },
         });
 
         let tools = req
@@ -437,10 +416,7 @@ impl From<OpenAiChatResponse> for ChatResponse {
             content,
             stop_reason,
             tool_calls,
-            usage: Usage {
-                input_tokens: resp.usage.prompt_tokens,
-                output_tokens: resp.usage.completion_tokens,
-            },
+            usage: Usage { input_tokens: resp.usage.prompt_tokens, output_tokens: resp.usage.completion_tokens },
             tags: Vec::new(),
         }
     }
@@ -462,10 +438,7 @@ impl From<ChatResponse> for OpenAiChatResponse {
                 .map(|tc| OpenAiToolCall {
                     id: tc.id,
                     call_type: "function".to_string(),
-                    function: OpenAiFunctionCall {
-                        name: tc.name,
-                        arguments: tc.input.to_string(),
-                    },
+                    function: OpenAiFunctionCall { name: tc.name, arguments: tc.input.to_string() },
                 })
                 .collect()
         });
@@ -592,10 +565,7 @@ impl OpenAiStreamDecoder {
                 .usage
                 .map(|u| Usage { input_tokens: u.prompt_tokens, output_tokens: u.completion_tokens })
                 .unwrap_or_default();
-            events.push(StreamEvent::Done {
-                stop_reason: stop_reason_from_finish_reason(Some(&reason)),
-                usage,
-            });
+            events.push(StreamEvent::Done { stop_reason: stop_reason_from_finish_reason(Some(&reason)), usage });
         }
 
         events

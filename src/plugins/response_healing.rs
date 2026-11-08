@@ -59,9 +59,7 @@ fn heal_json(input: &str) -> Option<String> {
 
     let candidate = balance_brackets(&remove_trailing_commas(text));
 
-    serde_json::from_str::<Value>(&candidate)
-        .ok()
-        .map(|_| candidate)
+    serde_json::from_str::<Value>(&candidate).ok().map(|_| candidate)
 }
 
 /// Strips a surrounding ```` ```json ... ``` ```` (or plain ` ``` `) fence,

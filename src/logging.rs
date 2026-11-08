@@ -35,19 +35,10 @@ pub enum RouterEvent {
         in_flight: u64,
     },
     /// Emitted after classifiers run, before routing. `tags` may be empty.
-    Classified {
-        id: u64,
-        ts_ms: u64,
-        tags: Vec<String>,
-    },
+    Classified { id: u64, ts_ms: u64, tags: Vec<String> },
     /// Emitted after the router resolves a provider and model, before the
     /// upstream call goes out.
-    Routed {
-        id: u64,
-        ts_ms: u64,
-        provider: String,
-        model: String,
-    },
+    Routed { id: u64, ts_ms: u64, provider: String, model: String },
     /// Emitted when the pipeline finishes (response or error). `id` matches
     /// the corresponding `Start` event.
     Complete {
@@ -89,10 +80,7 @@ pub struct LogEntry {
 
 impl LogEntry {
     pub fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
     }
 }
 
@@ -109,9 +97,7 @@ impl RequestLogger {
             }
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(RequestLogger {
-            file: Mutex::new(file),
-        })
+        Ok(RequestLogger { file: Mutex::new(file) })
     }
 
     /// Appends a pre-serialized JSON line to the log file.

@@ -18,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use futures_core::Stream;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -64,9 +64,8 @@ pub fn build_app(state: AppState, dashboard: bool) -> AxumRouter {
         .route("/v1/feedback", post(feedback));
 
     if dashboard {
-        protected = protected
-            .route("/dashboard", get(dashboard_page))
-            .route("/dashboard/events", get(dashboard_events));
+        protected =
+            protected.route("/dashboard", get(dashboard_page)).route("/dashboard/events", get(dashboard_events));
     }
 
     let protected = protected.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
@@ -91,11 +90,7 @@ fn presented_key(headers: &HeaderMap, query: &str) -> Option<String> {
     if let Some(value) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(value.to_string());
     }
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(k, _)| *k == "api_key")
-        .map(|(_, v)| v.to_string())
+    query.split('&').filter_map(|pair| pair.split_once('=')).find(|(k, _)| *k == "api_key").map(|(_, v)| v.to_string())
 }
 
 /// Rejects any request that doesn't present `state.api_key`, when one is
@@ -121,9 +116,7 @@ async fn dashboard_page() -> Html<&'static str> {
 }
 
 /// Streams [`RouterEvent`] JSON as SSE `data:` events for every request.
-async fn dashboard_events(
-    State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+async fn dashboard_events(State(state): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = BroadcastStream::new(state.events.subscribe())
         .filter_map(|msg| msg.ok().map(|line| Ok(Event::default().data(line.to_string()))));
 
@@ -144,23 +137,15 @@ enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            ApiError::NoProvider(model) => (
-                StatusCode::BAD_REQUEST,
-                format!("no provider configured for model '{model}'"),
-            ),
+            ApiError::NoProvider(model) => {
+                (StatusCode::BAD_REQUEST, format!("no provider configured for model '{model}'"))
+            }
             ApiError::Upstream(err) => (StatusCode::BAD_GATEWAY, err.to_string()),
-            ApiError::Plugin(id, err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("plugin '{id}' failed: {err}"),
-            ),
-            ApiError::NoResponse => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "pipeline stopped without producing a response".to_string(),
-            ),
-            ApiError::Unauthorized => (
-                StatusCode::UNAUTHORIZED,
-                "missing or invalid API key".to_string(),
-            ),
+            ApiError::Plugin(id, err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("plugin '{id}' failed: {err}")),
+            ApiError::NoResponse => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "pipeline stopped without producing a response".to_string())
+            }
+            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "missing or invalid API key".to_string()),
             ApiError::Feedback(status, message) => (status, message),
         };
 
@@ -199,10 +184,7 @@ async fn run_stage(
     active: &mut Vec<String>,
 ) -> Result<Flow, ApiError> {
     for (plugin, settings) in plugins {
-        let ctx = PluginContext {
-            client: client.clone(),
-            settings: settings.clone(),
-        };
+        let ctx = PluginContext { client: client.clone(), settings: settings.clone() };
 
         let result = match stage {
             Stage::Start => plugin.on_start(&ctx, req, resp).await,
@@ -263,11 +245,7 @@ fn current_trace_id() -> Option<String> {
 
     let context = tracing::Span::current().context();
     let trace_id = context.span().span_context().trace_id();
-    if trace_id == opentelemetry::trace::TraceId::INVALID {
-        None
-    } else {
-        Some(trace_id.to_string())
-    }
+    if trace_id == opentelemetry::trace::TraceId::INVALID { None } else { Some(trace_id.to_string()) }
 }
 
 /// Records request-count, duration, and token metrics via the globally
@@ -281,10 +259,7 @@ fn record_metrics(provider: &str, model: &str, duration: Duration, usage: Option
         opentelemetry::KeyValue::new("error", error),
     ];
     meter.u64_counter("router.requests").build().add(1, &attrs);
-    meter
-        .f64_histogram("router.request.duration_ms")
-        .build()
-        .record(duration.as_millis() as f64, &attrs);
+    meter.f64_histogram("router.request.duration_ms").build().record(duration.as_millis() as f64, &attrs);
     if let Some(usage) = usage {
         meter.u64_counter("router.tokens.input").build().add(usage.input_tokens as u64, &attrs);
         meter.u64_counter("router.tokens.output").build().add(usage.output_tokens as u64, &attrs);
@@ -334,12 +309,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
     let requested_model = req.model.clone();
     let started = Instant::now();
 
-    broadcast(state, &RouterEvent::Start {
-        id,
-        ts_ms: LogEntry::now_ms(),
-        model: requested_model.clone(),
-        in_flight,
-    });
+    broadcast(state, &RouterEvent::Start { id, ts_ms: LogEntry::now_ms(), model: requested_model.clone(), in_flight });
 
     let resolved_plugins = state.plugins.resolve(&req);
     let mut resp: Option<ChatResponse> = None;
@@ -347,27 +317,24 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
     let mut sent_model = req.model.clone();
     let mut provider_name = "plugin".to_string();
 
-    if run_stage(&resolved_plugins, &state.client, Stage::Start, &mut req, &mut resp, &mut active_plugins).await? == Flow::Continue {
+    if run_stage(&resolved_plugins, &state.client, Stage::Start, &mut req, &mut resp, &mut active_plugins).await?
+        == Flow::Continue
+    {
         let classified = state.classifiers.classify(&req).await;
         req.tags = classified.tags;
         req.routes = classified.routes;
         tracing::Span::current().record("tags", format!("{:?}", req.tags));
-        broadcast(state, &RouterEvent::Classified {
-            id,
-            ts_ms: LogEntry::now_ms(),
-            tags: req.tags.clone(),
-        });
+        broadcast(state, &RouterEvent::Classified { id, ts_ms: LogEntry::now_ms(), tags: req.tags.clone() });
 
         let routing_flow =
-            run_stage(&resolved_plugins, &state.client, Stage::PreRouting, &mut req, &mut resp, &mut active_plugins).await?;
+            run_stage(&resolved_plugins, &state.client, Stage::PreRouting, &mut req, &mut resp, &mut active_plugins)
+                .await?;
 
         if routing_flow == Flow::Continue && resp.is_none() {
             let (provider, target_model) = match &req.forced_provider {
                 Some(name) => {
-                    let provider = state
-                        .router
-                        .provider(name)
-                        .ok_or_else(|| ApiError::NoProvider(req.model.clone()))?;
+                    let provider =
+                        state.router.provider(name).ok_or_else(|| ApiError::NoProvider(req.model.clone()))?;
                     (provider, req.model.clone())
                 }
                 None => state
@@ -380,12 +347,15 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
             provider_name = provider.name.clone();
             tracing::Span::current().record("provider", &provider_name);
             tracing::Span::current().record("model", &sent_model);
-            broadcast(state, &RouterEvent::Routed {
-                id,
-                ts_ms: LogEntry::now_ms(),
-                provider: provider_name.clone(),
-                model: target_model.clone(),
-            });
+            broadcast(
+                state,
+                &RouterEvent::Routed {
+                    id,
+                    ts_ms: LogEntry::now_ms(),
+                    provider: provider_name.clone(),
+                    model: target_model.clone(),
+                },
+            );
             req.model = target_model;
 
             let send_span = tracing::info_span!("provider.send", provider = %provider_name, model = %sent_model);
@@ -394,31 +364,35 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
                 Err(err) => {
                     let duration = started.elapsed();
                     record_metrics(&provider_name, &sent_model, duration, None, true);
-                    broadcast(state, &RouterEvent::Complete {
-                        id,
-                        entry: LogEntry {
-                            ts_ms: LogEntry::now_ms(),
-                            provider: provider_name,
-                            requested_model,
-                            sent_model,
-                            duration_ms: duration.as_millis() as u64,
-                            tags: req.tags,
-                            routes: req.routes,
-                            plugins: active_plugins,
-                            system: req.system,
-                            messages: req.messages,
-                            response: None,
-                            error: Some(err.to_string()),
-                            trace_id: current_trace_id(),
+                    broadcast(
+                        state,
+                        &RouterEvent::Complete {
+                            id,
+                            entry: LogEntry {
+                                ts_ms: LogEntry::now_ms(),
+                                provider: provider_name,
+                                requested_model,
+                                sent_model,
+                                duration_ms: duration.as_millis() as u64,
+                                tags: req.tags,
+                                routes: req.routes,
+                                plugins: active_plugins,
+                                system: req.system,
+                                messages: req.messages,
+                                response: None,
+                                error: Some(err.to_string()),
+                                trace_id: current_trace_id(),
+                            },
                         },
-                    });
+                    );
                     return Err(ApiError::Upstream(err));
                 }
             }
         }
     }
 
-    if run_stage(&resolved_plugins, &state.client, Stage::PostResponse, &mut req, &mut resp, &mut active_plugins).await?
+    if run_stage(&resolved_plugins, &state.client, Stage::PostResponse, &mut req, &mut resp, &mut active_plugins)
+        .await?
         == Flow::Continue
     {
         if let Some(r) = &mut resp {
@@ -434,32 +408,29 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
     let model = sent_model.clone();
     let duration = started.elapsed();
     record_metrics(&provider_name, &sent_model, duration, resp.as_ref().map(|r| &r.usage), false);
-    broadcast(state, &RouterEvent::Complete {
-        id,
-        entry: LogEntry {
-            ts_ms: LogEntry::now_ms(),
-            provider: provider_name,
-            requested_model,
-            sent_model,
-            duration_ms: duration.as_millis() as u64,
-            tags: req.tags,
-            routes: req.routes,
-            plugins: active_plugins,
-            system: req.system,
-            messages: req.messages,
-            response: resp.clone(),
-            error: None,
-            trace_id: current_trace_id(),
+    broadcast(
+        state,
+        &RouterEvent::Complete {
+            id,
+            entry: LogEntry {
+                ts_ms: LogEntry::now_ms(),
+                provider: provider_name,
+                requested_model,
+                sent_model,
+                duration_ms: duration.as_millis() as u64,
+                tags: req.tags,
+                routes: req.routes,
+                plugins: active_plugins,
+                system: req.system,
+                messages: req.messages,
+                response: resp.clone(),
+                error: None,
+                trace_id: current_trace_id(),
+            },
         },
-    });
+    );
 
-    resp.ok_or(ApiError::NoResponse).map(|response| DispatchOutcome {
-        response,
-        request_tags,
-        provider,
-        model,
-        routes,
-    })
+    resp.ok_or(ApiError::NoResponse).map(|response| DispatchOutcome { response, request_tags, provider, model, routes })
 }
 
 /// Sets `header_name` to a comma-separated tag list (e.g. `vision,nsfw`),
@@ -550,10 +521,7 @@ enum ClientFormat {
     Responses,
 }
 
-async fn chat_completions(
-    State(state): State<AppState>,
-    Json(body): Json<openai::OpenAiChatRequest>,
-) -> Response {
+async fn chat_completions(State(state): State<AppState>, Json(body): Json<openai::OpenAiChatRequest>) -> Response {
     let streaming = body.stream;
     if streaming {
         dispatch_stream(state, body.into(), ClientFormat::OpenAi).await
@@ -563,7 +531,14 @@ async fn chat_completions(
                 let response_tags = outcome.response.tags.clone();
                 let usage = outcome.response.usage.clone();
                 let mut response = Json(openai::OpenAiChatResponse::from(outcome.response)).into_response();
-                apply_router_headers(&mut response, &outcome.request_tags, &response_tags, &outcome.provider, &outcome.model, &usage);
+                apply_router_headers(
+                    &mut response,
+                    &outcome.request_tags,
+                    &response_tags,
+                    &outcome.provider,
+                    &outcome.model,
+                    &usage,
+                );
                 apply_route_headers(&mut response, &outcome.routes);
                 response
             }
@@ -590,31 +565,23 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
     let requested_model = req.model.clone();
     let started = Instant::now();
 
-    broadcast(&state, &RouterEvent::Start {
-        id,
-        ts_ms: LogEntry::now_ms(),
-        model: requested_model.clone(),
-        in_flight,
-    });
+    broadcast(&state, &RouterEvent::Start { id, ts_ms: LogEntry::now_ms(), model: requested_model.clone(), in_flight });
 
     // Classify + route without running plugins.
     let classified = state.classifiers.classify(&req).await;
     req.tags = classified.tags;
     req.routes = classified.routes;
     tracing::Span::current().record("tags", format!("{:?}", req.tags));
-    broadcast(&state, &RouterEvent::Classified {
-        id,
-        ts_ms: LogEntry::now_ms(),
-        tags: req.tags.clone(),
-    });
+    broadcast(&state, &RouterEvent::Classified { id, ts_ms: LogEntry::now_ms(), tags: req.tags.clone() });
 
-    let (provider, target_model) = match state.router.resolve(&req.model, &req.tags, &req.routes, &req.needed_capabilities()) {
-        Some(p) => p,
-        None => {
-            state.in_flight.fetch_sub(1, Ordering::Relaxed);
-            return ApiError::NoProvider(req.model.clone()).into_response();
-        }
-    };
+    let (provider, target_model) =
+        match state.router.resolve(&req.model, &req.tags, &req.routes, &req.needed_capabilities()) {
+            Some(p) => p,
+            None => {
+                state.in_flight.fetch_sub(1, Ordering::Relaxed);
+                return ApiError::NoProvider(req.model.clone()).into_response();
+            }
+        };
 
     let provider_name = provider.name.clone();
     let sent_model = target_model.clone();
@@ -622,12 +589,15 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
     let routes = req.routes.clone();
     tracing::Span::current().record("provider", &provider_name);
     tracing::Span::current().record("model", &sent_model);
-    broadcast(&state, &RouterEvent::Routed {
-        id,
-        ts_ms: LogEntry::now_ms(),
-        provider: provider_name.clone(),
-        model: target_model.clone(),
-    });
+    broadcast(
+        &state,
+        &RouterEvent::Routed {
+            id,
+            ts_ms: LogEntry::now_ms(),
+            provider: provider_name.clone(),
+            model: target_model.clone(),
+        },
+    );
     req.model = target_model;
 
     let send_span = tracing::info_span!("provider.send", provider = %provider_name, model = %sent_model);
@@ -652,7 +622,8 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
     let state_clone = state.clone();
     let in_flight_arc = state.in_flight.clone();
 
-    let stream_span = tracing::info_span!("dispatch_stream.body", request_id = id, provider = %provider_name, model = %sent_model);
+    let stream_span =
+        tracing::info_span!("dispatch_stream.body", request_id = id, provider = %provider_name, model = %sent_model);
     tokio::spawn(
         async move {
             let _guard = InFlightGuard(in_flight_arc);
@@ -666,24 +637,27 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
 
             let duration = started.elapsed();
             record_metrics(&provider_name, &sent_model, duration, None, false);
-            broadcast(&state_clone, &RouterEvent::Complete {
-                id,
-                entry: LogEntry {
-                    ts_ms: LogEntry::now_ms(),
-                    provider: provider_name,
-                    requested_model,
-                    sent_model,
-                    duration_ms: duration.as_millis() as u64,
-                    tags,
-                    routes: req.routes,
-                    plugins: Vec::new(),
-                    system: req.system,
-                    messages: req.messages,
-                    response: None,
-                    error: None,
-                    trace_id: current_trace_id(),
+            broadcast(
+                &state_clone,
+                &RouterEvent::Complete {
+                    id,
+                    entry: LogEntry {
+                        ts_ms: LogEntry::now_ms(),
+                        provider: provider_name,
+                        requested_model,
+                        sent_model,
+                        duration_ms: duration.as_millis() as u64,
+                        tags,
+                        routes: req.routes,
+                        plugins: Vec::new(),
+                        system: req.system,
+                        messages: req.messages,
+                        response: None,
+                        error: None,
+                        trace_id: current_trace_id(),
+                    },
                 },
-            });
+            );
         }
         .instrument(stream_span),
     );
@@ -699,10 +673,7 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
     response
 }
 
-async fn messages(
-    State(state): State<AppState>,
-    Json(body): Json<anthropic::AnthropicMessagesRequest>,
-) -> Response {
+async fn messages(State(state): State<AppState>, Json(body): Json<anthropic::AnthropicMessagesRequest>) -> Response {
     let streaming = body.stream;
     if streaming {
         dispatch_stream(state, body.into(), ClientFormat::Anthropic).await
@@ -712,7 +683,14 @@ async fn messages(
                 let response_tags = outcome.response.tags.clone();
                 let usage = outcome.response.usage.clone();
                 let mut response = Json(anthropic::AnthropicMessagesResponse::from(outcome.response)).into_response();
-                apply_router_headers(&mut response, &outcome.request_tags, &response_tags, &outcome.provider, &outcome.model, &usage);
+                apply_router_headers(
+                    &mut response,
+                    &outcome.request_tags,
+                    &response_tags,
+                    &outcome.provider,
+                    &outcome.model,
+                    &usage,
+                );
                 apply_route_headers(&mut response, &outcome.routes);
                 response
             }
@@ -721,10 +699,7 @@ async fn messages(
     }
 }
 
-async fn responses_endpoint(
-    State(state): State<AppState>,
-    Json(body): Json<responses::ResponsesRequest>,
-) -> Response {
+async fn responses_endpoint(State(state): State<AppState>, Json(body): Json<responses::ResponsesRequest>) -> Response {
     let streaming = body.stream;
     if streaming {
         dispatch_stream(state, body.into(), ClientFormat::Responses).await
@@ -734,7 +709,14 @@ async fn responses_endpoint(
                 let response_tags = outcome.response.tags.clone();
                 let usage = outcome.response.usage.clone();
                 let mut response = Json(responses::ResponsesResponse::from(outcome.response)).into_response();
-                apply_router_headers(&mut response, &outcome.request_tags, &response_tags, &outcome.provider, &outcome.model, &usage);
+                apply_router_headers(
+                    &mut response,
+                    &outcome.request_tags,
+                    &response_tags,
+                    &outcome.provider,
+                    &outcome.model,
+                    &usage,
+                );
                 apply_route_headers(&mut response, &outcome.routes);
                 response
             }
@@ -766,10 +748,9 @@ async fn feedback(
 
     match classifier.feedback(&body.decision_id, &body.label, body.comment).await {
         Ok(learned) => Ok(Json(learned)),
-        Err(cev::Error::Api { status, message }) => Err(ApiError::Feedback(
-            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-            message,
-        )),
+        Err(cev::Error::Api { status, message }) => {
+            Err(ApiError::Feedback(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), message))
+        }
         Err(err) => Err(ApiError::Feedback(StatusCode::BAD_GATEWAY, err.to_string())),
     }
 }
@@ -1038,7 +1019,8 @@ mod tests {
 
         // Both picks are in the request log.
         let entry = completed(&mut logged).await;
-        let picks: Vec<_> = entry["routes"].as_array().unwrap().iter().map(|r| (&r["classifier"], &r["choice"])).collect();
+        let picks: Vec<_> =
+            entry["routes"].as_array().unwrap().iter().map(|r| (&r["classifier"], &r["choice"])).collect();
         assert_eq!(picks, [(&json!("cev"), &json!("deepseek-r1:latest")), (&json!("llm"), &json!("general"))]);
 
         // llm's pick labels cev's decision, in the background.
@@ -1175,35 +1157,50 @@ mod tests {
     /// (which the router drops) included.
     const ANTHROPIC_TOOL_USE_SSE: &str = concat!(
         "event: message_start\n",
-        r#"data: {"type":"message_start","message":{"id":"msg_up","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}"#, "\n\n",
+        r#"data: {"type":"message_start","message":{"id":"msg_up","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}"#,
+        "\n\n",
         "event: content_block_start\n",
-        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#, "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+        "\n\n",
         "event: content_block_delta\n",
-        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Need the weather tool."}}"#, "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Need the weather tool."}}"#,
+        "\n\n",
         "event: content_block_stop\n",
-        r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
         "event: content_block_start\n",
-        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#, "\n\n",
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
         "event: ping\n",
-        r#"data: {"type": "ping"}"#, "\n\n",
+        r#"data: {"type": "ping"}"#,
+        "\n\n",
         "event: content_block_delta\n",
-        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hel"}}"#, "\n\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hel"}}"#,
+        "\n\n",
         "event: content_block_delta\n",
-        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"lo ☀"}}"#, "\n\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"lo ☀"}}"#,
+        "\n\n",
         "event: content_block_stop\n",
-        r#"data: {"type":"content_block_stop","index":1}"#, "\n\n",
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        "\n\n",
         "event: content_block_start\n",
-        r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#, "\n\n",
+        r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
+        "\n\n",
         "event: content_block_delta\n",
-        r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\": "}}"#, "\n\n",
+        r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\": "}}"#,
+        "\n\n",
         "event: content_block_delta\n",
-        r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"Paris\"}"}}"#, "\n\n",
+        r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"Paris\"}"}}"#,
+        "\n\n",
         "event: content_block_stop\n",
-        r#"data: {"type":"content_block_stop","index":2}"#, "\n\n",
+        r#"data: {"type":"content_block_stop","index":2}"#,
+        "\n\n",
         "event: message_delta\n",
-        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":42}}"#, "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":42}}"#,
+        "\n\n",
         "event: message_stop\n",
-        r#"data: {"type":"message_stop"}"#, "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
     );
 
     /// An upstream Anthropic streaming reply that starts normally, then fails
@@ -1211,13 +1208,17 @@ mod tests {
     /// it has already answered `200`.
     const ANTHROPIC_ERROR_SSE: &str = concat!(
         "event: message_start\n",
-        r#"data: {"type":"message_start","message":{"id":"msg_up","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","usage":{"input_tokens":25,"output_tokens":1}}}"#, "\n\n",
+        r#"data: {"type":"message_start","message":{"id":"msg_up","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","usage":{"input_tokens":25,"output_tokens":1}}}"#,
+        "\n\n",
         "event: content_block_start\n",
-        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
         "event: content_block_delta\n",
-        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#, "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#,
+        "\n\n",
         "event: error\n",
-        r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#, "\n\n",
+        r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        "\n\n",
     );
 
     /// Env var the test provider's `api_key_env` names; see
@@ -1363,8 +1364,12 @@ mod tests {
         assert_eq!(events[1].1["content_block"]["type"], "text");
         assert_eq!(events[2].1["delta"]["text"], "Hel");
         assert_eq!(events[3].1["delta"]["text"], "lo ☀");
-        assert_eq!(events[5].1["content_block"], json!({"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}));
-        let partial_json: String = events[6..8].iter().map(|(_, e)| e["delta"]["partial_json"].as_str().unwrap()).collect();
+        assert_eq!(
+            events[5].1["content_block"],
+            json!({"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}})
+        );
+        let partial_json: String =
+            events[6..8].iter().map(|(_, e)| e["delta"]["partial_json"].as_str().unwrap()).collect();
         assert_eq!(partial_json, r#"{"city": "Paris"}"#);
         assert_eq!(events[9].1["delta"]["stop_reason"], "tool_use");
         assert_eq!(events[9].1["usage"], json!({"input_tokens": 25, "output_tokens": 42}));
@@ -1388,7 +1393,8 @@ mod tests {
         let chunks: Vec<Value> = data[..data.len() - 1].iter().map(|d| serde_json::from_str(d).unwrap()).collect();
         let text: String = chunks.iter().filter_map(|c| c["choices"][0]["delta"]["content"].as_str()).collect();
         assert_eq!(text, "Hello ☀");
-        let tool_deltas: Vec<&Value> = chunks.iter().filter_map(|c| c["choices"][0]["delta"]["tool_calls"].get(0)).collect();
+        let tool_deltas: Vec<&Value> =
+            chunks.iter().filter_map(|c| c["choices"][0]["delta"]["tool_calls"].get(0)).collect();
         assert_eq!(tool_deltas[0]["id"], "toolu_1");
         assert_eq!(tool_deltas[0]["function"]["name"], "get_weather");
         let arguments: String = tool_deltas.iter().map(|t| t["function"]["arguments"].as_str().unwrap()).collect();

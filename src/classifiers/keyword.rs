@@ -53,10 +53,7 @@ impl Classifier for KeywordClassifier {
             let Some(keywords) = keywords.as_array() else {
                 continue;
             };
-            let hit = keywords
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|kw| haystack.contains(&kw.to_lowercase()));
+            let hit = keywords.iter().filter_map(Value::as_str).any(|kw| haystack.contains(&kw.to_lowercase()));
             if hit {
                 matched.push(tag.clone());
             }
@@ -96,10 +93,7 @@ mod tests {
     async fn tags_on_keyword_match() {
         let classifier = KeywordClassifier;
         let ctx = ClassifierContext {
-            settings: json!({"tags": {"vision": ["image", "photo"], "nsfw": ["banned"]}})
-                .as_object()
-                .unwrap()
-                .clone(),
+            settings: json!({"tags": {"vision": ["image", "photo"], "nsfw": ["banned"]}}).as_object().unwrap().clone(),
         };
 
         let req = request(None, "Can you describe this Image for me?");
@@ -129,10 +123,7 @@ mod tests {
     async fn no_match_returns_empty() {
         let classifier = KeywordClassifier;
         let ctx = ClassifierContext {
-            settings: json!({"tags": {"vision": ["image", "photo"]}})
-                .as_object()
-                .unwrap()
-                .clone(),
+            settings: json!({"tags": {"vision": ["image", "photo"]}}).as_object().unwrap().clone(),
         };
 
         let req = request(None, "What's the weather like today?");
@@ -143,9 +134,7 @@ mod tests {
     #[tokio::test]
     async fn no_config_returns_empty() {
         let classifier = KeywordClassifier;
-        let ctx = ClassifierContext {
-            settings: Default::default(),
-        };
+        let ctx = ClassifierContext { settings: Default::default() };
 
         let req = request(None, "anything");
         let tags = classifier.classify(&ctx, &req).await.unwrap().tags;
@@ -155,9 +144,7 @@ mod tests {
     #[tokio::test]
     async fn ignores_image_and_tool_content() {
         let classifier = KeywordClassifier;
-        let ctx = ClassifierContext {
-            settings: json!({"tags": {"vision": ["image"]}}).as_object().unwrap().clone(),
-        };
+        let ctx = ClassifierContext { settings: json!({"tags": {"vision": ["image"]}}).as_object().unwrap().clone() };
 
         let mut req = request(None, "what's in this picture?");
         req.messages = vec![Message {

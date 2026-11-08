@@ -160,11 +160,7 @@ impl Media {
     /// reports them.
     fn of(modalities: &[String], family: &str) -> Self {
         let takes = |modality: &str| modalities.iter().any(|m| m == modality);
-        Media {
-            images: takes("image"),
-            audio: takes("audio"),
-            one_kind: family == "d1-omni",
-        }
+        Media { images: takes("image"), audio: takes("audio"), one_kind: family == "d1-omni" }
     }
 }
 
@@ -230,10 +226,7 @@ impl Direct {
                         CevError::NotFound(_) => 404,
                         CevError::Internal(_) => 500,
                     };
-                    cev::Error::Api {
-                        status,
-                        message: err.to_string(),
-                    }
+                    cev::Error::Api { status, message: err.to_string() }
                 })
             }
         }
@@ -259,10 +252,7 @@ async fn call<T: DeserializeOwned>(mut request: reqwest::RequestBuilder, key: &O
             .ok()
             .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
             .unwrap_or(body);
-        return Err(cev::Error::Api {
-            status: status.as_u16(),
-            message,
-        });
+        return Err(cev::Error::Api { status: status.as_u16(), message });
     }
     serde_json::from_str(&body).map_err(|err| cev::Error::Protocol(err.to_string()))
 }
@@ -297,11 +287,7 @@ impl CevClassifier {
                     Some(key) => Cev::http(url.as_str()).with_api_key(key.as_str()),
                     None => Cev::http(url.as_str()),
                 };
-                let direct = Direct::Http {
-                    url: url.clone(),
-                    key,
-                    client: reqwest::Client::new(),
-                };
+                let direct = Direct::Http { url: url.clone(), key, client: reqwest::Client::new() };
                 (cev, direct)
             }
             (None, Some(model)) => local(model, &settings.db)?,
@@ -415,10 +401,7 @@ impl CevClassifier {
     /// The name of the option that routes to `provider` and `model`, if one
     /// does.
     pub fn option_for(&self, provider: &str, model: &str) -> Option<&str> {
-        self.models
-            .iter()
-            .find(|m| m.provider == provider && m.model == model)
-            .map(ModelOption::name)
+        self.models.iter().find(|m| m.provider == provider && m.model == model).map(ModelOption::name)
     }
 
     /// Whether [`Self::learn_from_llm`] sends anything.
@@ -477,10 +460,7 @@ fn local(model: &str, db: &str) -> anyhow::Result<(Cev, Direct)> {
     use cev_runtime::{RuntimeConfig, Store};
 
     // Any model cev runs; which kind it is is told from its files.
-    let backend = cev_model::load(EngineOptions {
-        model: model.to_string(),
-        ..Default::default()
-    })?;
+    let backend = cev_model::load(EngineOptions { model: model.to_string(), ..Default::default() })?;
     let store = Store::open(db)?;
     let runtime = Arc::new(cev_runtime::Cev::new(backend, store, RuntimeConfig::default())?);
 
@@ -539,13 +519,7 @@ impl Classifier for CevClassifier {
             .await
             .with_context(|| format!("no answer from cev within {:?}", self.timeout))??;
 
-        let Some(Answer::Choice {
-            choice,
-            confidence,
-            probabilities,
-            x_cev,
-        }) = response.answers.get(QUESTION)
-        else {
+        let Some(Answer::Choice { choice, confidence, probabilities, x_cev }) = response.answers.get(QUESTION) else {
             bail!("cev didn't answer with a choice");
         };
         let picked = self
@@ -629,7 +603,8 @@ pub(crate) mod tests {
         let store = Store::in_memory().unwrap();
         let runtime = cev_runtime::Cev::new(Arc::new(backend), store, RuntimeConfig::default()).unwrap();
         let runtime = Arc::new(runtime);
-        let classifier = CevClassifier::new(Cev::from_runtime(runtime.clone()), Direct::Local(runtime.clone()), settings);
+        let classifier =
+            CevClassifier::new(Cev::from_runtime(runtime.clone()), Direct::Local(runtime.clone()), settings);
         (classifier.unwrap(), runtime)
     }
 
@@ -658,24 +633,16 @@ pub(crate) mod tests {
     }
 
     async fn route_request(classifier: &CevClassifier, req: &ChatRequest) -> RouteChoice {
-        let ctx = ClassifierContext {
-            settings: Default::default(),
-        };
+        let ctx = ClassifierContext { settings: Default::default() };
         classifier.classify(&ctx, req).await.unwrap().route.unwrap()
     }
 
     fn image(media_type: &str, data: &str) -> ContentPart {
-        ContentPart::Image {
-            media_type: media_type.to_string(),
-            data: data.to_string(),
-        }
+        ContentPart::Image { media_type: media_type.to_string(), data: data.to_string() }
     }
 
     fn audio(format: &str, data: &str) -> ContentPart {
-        ContentPart::Audio {
-            format: format.to_string(),
-            data: data.to_string(),
-        }
+        ContentPart::Audio { format: format.to_string(), data: data.to_string() }
     }
 
     /// A request whose latest user turn has two PNGs, a HEIC cev can't
@@ -711,21 +678,13 @@ pub(crate) mod tests {
             classifier.max_images = max_images;
             classifier
         };
-        let images = Media {
-            images: true,
-            audio: false,
-            one_kind: false,
-        };
+        let images = Media { images: true, audio: false, one_kind: false };
         assert_eq!(with(images, 4).media(&media_request()).await, (both.0.clone(), None));
         assert_eq!(with(images, 1).media(&media_request()).await, (vec![both.0[0].clone()], None));
         assert_eq!(with(images, 0).media(&media_request()).await, (Vec::new(), None));
 
         // d1-omni takes one kind at a time, and gets the clip.
-        let d1_omni = Media {
-            images: true,
-            audio: true,
-            one_kind: true,
-        };
+        let d1_omni = Media { images: true, audio: true, one_kind: true };
         assert_eq!(with(d1_omni, 4).media(&media_request()).await, (Vec::new(), both.1.clone()));
         let mut no_clip = media_request();
         no_clip.messages[0].content.pop();
@@ -742,10 +701,7 @@ pub(crate) mod tests {
         req.messages[0].content.push(png());
         req.messages.push(Message {
             role: Role::User,
-            content: vec![ContentPart::ToolResult {
-                tool_use_id: "call_1".to_string(),
-                content: "ok".to_string(),
-            }],
+            content: vec![ContentPart::ToolResult { tool_use_id: "call_1".to_string(), content: "ok".to_string() }],
         });
         assert_eq!(classifier.media(&req).await.0.len(), 1);
         req.messages.push(Message::text(Role::Assistant, "A cat."));
@@ -753,10 +709,7 @@ pub(crate) mod tests {
         assert_eq!(classifier.media(&req).await.0.len(), 0);
 
         // A picture sent on its own is still the latest turn.
-        req.messages.push(Message {
-            role: Role::User,
-            content: vec![png()],
-        });
+        req.messages.push(Message { role: Role::User, content: vec![png()] });
         assert_eq!(classifier.media(&req).await.0.len(), 1);
         assert_eq!(classifier.state(&req)["request"], "What breed?");
     }
@@ -782,15 +735,8 @@ pub(crate) mod tests {
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
             let (mock, _) = mock_classifier_and_runtime();
-            let direct = Direct::Http {
-                url: url.clone(),
-                key: None,
-                client: reqwest::Client::new(),
-            };
-            let settings = Settings {
-                models: mock.models,
-                ..Default::default()
-            };
+            let direct = Direct::Http { url: url.clone(), key: None, client: reqwest::Client::new() };
+            let settings = Settings { models: mock.models, ..Default::default() };
             (CevClassifier::new(Cev::http(url), direct, settings).unwrap(), asked)
         }
 
@@ -839,7 +785,8 @@ pub(crate) mod tests {
         let mut learned = None;
         for i in 0..8 {
             let decision = route(&classifier, &ask(i)).await;
-            learned = Some(classifier.feedback(decision.decision_id.as_deref().unwrap(), "general", None).await.unwrap());
+            learned =
+                Some(classifier.feedback(decision.decision_id.as_deref().unwrap(), "general", None).await.unwrap());
         }
         let learned = learned.unwrap();
         assert!(learned.learned);
@@ -877,10 +824,8 @@ pub(crate) mod tests {
         // A correction is stored next to it, so an export has both.
         classifier.feedback(decision_id, "deepseek-r1:latest", None).await.unwrap();
         let (_, labels) = runtime.decision(decision_id).unwrap().unwrap();
-        let stored: Vec<_> = labels
-            .iter()
-            .map(|l| json!({"label": l.label, "weight": l.weight, "metadata": l.metadata}))
-            .collect();
+        let stored: Vec<_> =
+            labels.iter().map(|l| json!({"label": l.label, "weight": l.weight, "metadata": l.metadata})).collect();
         assert_eq!(
             stored,
             [
@@ -894,10 +839,7 @@ pub(crate) mod tests {
         );
 
         // A pick of a model cev doesn't choose between labels nothing.
-        let elsewhere = RouteChoice {
-            model: "llama3.1:70b".to_string(),
-            ..pick
-        };
+        let elsewhere = RouteChoice { model: "llama3.1:70b".to_string(), ..pick };
         assert!(classifier.learn_from_llm(decision_id, &elsewhere, ("anthropic", "m")).await.unwrap().is_none());
     }
 
@@ -932,11 +874,7 @@ pub(crate) mod tests {
         let url = format!("http://{}/", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let direct = Direct::Http {
-            url,
-            key: Some("secret".to_string()),
-            client: reqwest::Client::new(),
-        };
+        let direct = Direct::Http { url, key: Some("secret".to_string()), client: reqwest::Client::new() };
         let label = |decision_id: &str| FeedbackRequest {
             decision_id: Some(decision_id.to_string()),
             request_id: None,
@@ -951,7 +889,10 @@ pub(crate) mod tests {
         assert_eq!(learned.task_examples, 3);
         let (auth, body) = received.lock().unwrap()[0].clone();
         assert_eq!(auth, "Bearer secret");
-        assert_eq!(body, json!({"decision_id": "dec_1", "label": "general", "weight": 0.5, "metadata": {"source": "llm"}}));
+        assert_eq!(
+            body,
+            json!({"decision_id": "dec_1", "label": "general", "weight": 0.5, "metadata": {"source": "llm"}})
+        );
 
         // The server's errors come back as cev's would.
         let err = direct.feedback(label("dec_missing")).await.unwrap_err();
@@ -994,14 +935,18 @@ pub(crate) mod tests {
         assert!(build(json!({"url": "http://x", "models": [a, b]})).is_ok());
 
         assert!(error(json!({"models": [a, b]})).contains("either `url`"));
-        assert!(error(json!({"url": "http://x", "model": "Qwen/Qwen3-0.6B", "models": [a, b]})).contains("either `url`"));
+        assert!(
+            error(json!({"url": "http://x", "model": "Qwen/Qwen3-0.6B", "models": [a, b]})).contains("either `url`")
+        );
         assert!(error(json!({"url": "http://x", "models": [a]})).contains("at least two"));
         assert!(error(json!({"url": "http://x", "models": [a, stray]})).contains("unknown provider 'nope'"));
         assert!(error(json!({"url": "http://x", "models": [a, a]})).contains("two models are named 'a'"));
         assert!(error(json!({"url": "http://x", "timeout": 5, "models": [a, b]})).contains("unknown field `timeout`"));
         assert!(error(json!({"url": "http://x", "llm_label_weight": -1, "models": [a, b]})).contains("0 or more"));
 
-        let learns = |weight: f64| build(json!({"url": "http://x", "llm_label_weight": weight, "models": [a, b]})).unwrap().learns_from_llm();
+        let learns = |weight: f64| {
+            build(json!({"url": "http://x", "llm_label_weight": weight, "models": [a, b]})).unwrap().learns_from_llm()
+        };
         assert!(learns(0.5));
         assert!(!learns(0.0));
     }
