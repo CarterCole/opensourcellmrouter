@@ -146,10 +146,10 @@ impl LlmClassifier {
             .iter()
             .find(|p| p.name == settings.provider)
             .with_context(|| format!("`provider` names unknown provider '{}'", settings.provider))?;
-        if let Some(var) = &provider.api_key_env {
-            if !key_is_set(var) {
-                bail!("its provider '{}' needs ${var}, which is not set", provider.name);
-            }
+        if let Some(var) = &provider.api_key_env
+            && !key_is_set(var)
+        {
+            bail!("its provider '{}' needs ${var}, which is not set", provider.name);
         }
 
         check_models(&settings.models, providers)?;

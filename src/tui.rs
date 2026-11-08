@@ -249,7 +249,7 @@ async fn read_sse(url: String, state: Arc<Mutex<AppState>>) {
                         state.lock().unwrap().on_routed(id, provider, model);
                     }
                     Ok(RouterEvent::Complete { id, entry }) => {
-                        state.lock().unwrap().on_complete(id, entry);
+                        state.lock().unwrap().on_complete(id, *entry);
                     }
                     Err(_) => {}
                 }
@@ -272,10 +272,10 @@ async fn event_loop(
         tick.tick().await;
 
         while event::poll(Duration::ZERO)? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(key, state).await? {
-                    return Ok(());
-                }
+            if let Event::Key(key) = event::read()?
+                && handle_key(key, state).await?
+            {
+                return Ok(());
             }
         }
 
@@ -413,10 +413,10 @@ async fn stream_chat(state: Arc<Mutex<AppState>>, base_url: &str, model: &str, h
                 return;
             }
 
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(text) = v["choices"][0]["delta"]["content"].as_str() {
-                    state.lock().unwrap().stream_buf.push_str(text);
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
+                && let Some(text) = v["choices"][0]["delta"]["content"].as_str()
+            {
+                state.lock().unwrap().stream_buf.push_str(text);
             }
         }
     }
@@ -619,7 +619,7 @@ fn render_stats(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
         let mut providers: Vec<(&String, &u32)> = s.stats.by_provider.iter().collect();
         providers.sort_by(|a, b| b.1.cmp(a.1));
         for (name, count) in providers {
-            let pct = if s.stats.total > 0 { count * 100 / s.stats.total } else { 0 };
+            let pct = (count * 100).checked_div(s.stats.total).unwrap_or(0);
             let ago = s.stats.last_ok.get(name).map(|&ts| ago_str(ts)).unwrap_or_else(|| "never".to_string());
             let ago_color = if ago == "never" { Color::Red } else { Color::DarkGray };
             lines.push(Line::from(vec![

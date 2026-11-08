@@ -536,10 +536,10 @@ impl OpenAiStreamDecoder {
             return events;
         };
 
-        if let Some(text) = choice.delta.content {
-            if !text.is_empty() {
-                events.push(StreamEvent::TextDelta { text });
-            }
+        if let Some(text) = choice.delta.content
+            && !text.is_empty()
+        {
+            events.push(StreamEvent::TextDelta { text });
         }
 
         for tc in choice.delta.tool_calls.into_iter().flatten() {
@@ -553,10 +553,10 @@ impl OpenAiStreamDecoder {
             if let Some(name) = tc.function.name {
                 events.push(StreamEvent::ToolCallStart { id: id.clone(), name });
             }
-            if let Some(partial_input) = tc.function.arguments {
-                if !partial_input.is_empty() {
-                    events.push(StreamEvent::ToolCallDelta { id, partial_input });
-                }
+            if let Some(partial_input) = tc.function.arguments
+                && !partial_input.is_empty()
+            {
+                events.push(StreamEvent::ToolCallDelta { id, partial_input });
             }
         }
 

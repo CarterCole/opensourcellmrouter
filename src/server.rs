@@ -82,10 +82,10 @@ pub fn build_app(state: AppState, dashboard: bool) -> AxumRouter {
 /// for `EventSource`, which can't set custom headers — see
 /// `static/dashboard.html`'s `location.search` passthrough).
 fn presented_key(headers: &HeaderMap, query: &str) -> Option<String> {
-    if let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        if let Some(key) = value.strip_prefix("Bearer ") {
-            return Some(key.to_string());
-        }
+    if let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        && let Some(key) = value.strip_prefix("Bearer ")
+    {
+        return Some(key.to_string());
     }
     if let Some(value) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(value.to_string());
@@ -118,7 +118,7 @@ async fn dashboard_page() -> Html<&'static str> {
 /// Streams [`RouterEvent`] JSON as SSE `data:` events for every request.
 async fn dashboard_events(State(state): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = BroadcastStream::new(state.events.subscribe())
-        .filter_map(|msg| msg.ok().map(|line| Ok(Event::default().data(line.to_string()))));
+        .filter_map(|msg| msg.ok().map(|line| Ok(Event::default().data(&line))));
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
@@ -227,10 +227,10 @@ fn broadcast(state: &AppState, event: &RouterEvent) {
         }
     };
 
-    if let Some(logger) = &state.logger {
-        if matches!(event, RouterEvent::Complete { .. }) {
-            logger.log_line(&line);
-        }
+    if let Some(logger) = &state.logger
+        && matches!(event, RouterEvent::Complete { .. })
+    {
+        logger.log_line(&line);
     }
 
     let _ = state.events.send(Arc::from(line));
@@ -368,7 +368,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
                         state,
                         &RouterEvent::Complete {
                             id,
-                            entry: LogEntry {
+                            entry: Box::new(LogEntry {
                                 ts_ms: LogEntry::now_ms(),
                                 provider: provider_name,
                                 requested_model,
@@ -382,7 +382,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
                                 response: None,
                                 error: Some(err.to_string()),
                                 trace_id: current_trace_id(),
-                            },
+                            }),
                         },
                     );
                     return Err(ApiError::Upstream(err));
@@ -412,7 +412,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
         state,
         &RouterEvent::Complete {
             id,
-            entry: LogEntry {
+            entry: Box::new(LogEntry {
                 ts_ms: LogEntry::now_ms(),
                 provider: provider_name,
                 requested_model,
@@ -426,7 +426,7 @@ async fn dispatch(state: &AppState, mut req: ChatRequest) -> Result<DispatchOutc
                 response: resp.clone(),
                 error: None,
                 trace_id: current_trace_id(),
-            },
+            }),
         },
     );
 
@@ -641,7 +641,7 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
                 &state_clone,
                 &RouterEvent::Complete {
                     id,
-                    entry: LogEntry {
+                    entry: Box::new(LogEntry {
                         ts_ms: LogEntry::now_ms(),
                         provider: provider_name,
                         requested_model,
@@ -655,7 +655,7 @@ async fn dispatch_stream(state: AppState, mut req: ChatRequest, client_format: C
                         response: None,
                         error: None,
                         trace_id: current_trace_id(),
-                    },
+                    }),
                 },
             );
         }
