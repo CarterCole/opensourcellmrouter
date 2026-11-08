@@ -30,6 +30,11 @@
 //! attached to the request as [`ChatRequest::route`], and a
 //! [`crate::config::RouterRule::Cev`] rule routes on it.
 //!
+//! If cev's model takes images or audio (d1, d3 and Qwen3.5 take images,
+//! d1-omni takes either), it also gets those of the latest user turn: up to
+//! `max_images` PNG, JPEG, WebP or GIF images, and a WAV clip. What the
+//! model takes is asked of cev once, the first time a request has any.
+//!
 //! Every answer has a decision id, returned to the client in the
 //! `x-cev-decision-id` response header and recorded in the request log.
 //! Posting it back to `/v1/feedback` with the model that should have been
@@ -51,13 +56,14 @@
 //! |---|---|---|
 //! | `url` | | Base URL of a `cev` server. Set this or `model`. |
 //! | `api_key_env` | | Environment variable holding the server's bearer token. |
-//! | `model` | | Qwen3 checkpoint (Hugging Face repo id or directory) to run in-process instead of `url`. |
+//! | `model` | | Model to run in-process instead of `url`: a short name such as `d1` or `kev:4b`, a Hugging Face repo id, or a directory. |
 //! | `db` | `cev.db` | With `model`: SQLite file for decisions, feedback and adapters. |
 //! | `models` | | The options to choose between; see below. |
 //! | `instructions` | "Which model is best suited to answer this request?" | The question. |
 //! | `task` | `llmrouter.route` | Key of the online adapter that learns from feedback. |
 //! | `timeout_ms` | `5000` | How long to wait for cev before routing without it. |
 //! | `max_chars` | `2000` | How much of the system prompt and of the message to send. |
+//! | `max_images` | `4` | Most images to send, for a model that takes them. `0` sends none. |
 //! | `llm_label_weight` | `1.0` | Weight of a label taken from an `llm` pick, against 1 for a correction. `0` takes none. |
 //!
 //! Each of `models` has a `provider` and `model` to route to, an optional
@@ -77,14 +83,19 @@ use cev::{Cev, FeedbackResponse, Label, SystemOneRequest};
 use cev_core::{Answer, FeedbackRequest, Question, QuestionType};
 use indexmap::IndexMap;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use tokio::sync::OnceCell;
 
 use super::{Classification, Classifier, ClassifierContext, ModelOption, check_models, clip, latest_user_text};
-use crate::canonical::{ChatRequest, RouteChoice};
+use crate::canonical::{ChatRequest, ContentPart, Message, Role, RouteChoice};
 use crate::config::ProviderConfig;
 
 /// Id of the one question in each request to cev.
 const QUESTION: &str = "route";
+
+/// Image types cev decodes.
+const IMAGE_TYPES: [&str; 5] = ["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"];
 
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -98,6 +109,7 @@ struct Settings {
     task: String,
     timeout_ms: u64,
     max_chars: usize,
+    max_images: usize,
     llm_label_weight: f64,
 }
 
@@ -113,6 +125,7 @@ impl Default for Settings {
             task: "llmrouter.route".to_string(),
             timeout_ms: 5000,
             max_chars: 2000,
+            max_images: 4,
             llm_label_weight: 1.0,
         }
     }
@@ -120,20 +133,60 @@ impl Default for Settings {
 
 pub struct CevClassifier {
     cev: Cev,
-    labels: Labels,
+    direct: Direct,
+    /// What cev's model takes besides text, once asked.
+    takes: OnceCell<Media>,
     /// The question asked about every request.
     question: Question,
     models: Vec<ModelOption>,
     timeout: Duration,
     max_chars: usize,
+    max_images: usize,
     /// Weight of a label taken from an `llm` pick; `None` takes none.
     llm_label_weight: Option<f64>,
 }
 
-/// Where labels are sent. [`Cev::feedback`] can't attach a label's
-/// `weight` or `metadata`, so labels take the same way it sends them, with
-/// those added.
-enum Labels {
+/// What a cev model takes besides text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Media {
+    images: bool,
+    audio: bool,
+    /// Takes images or audio in one request, not both (d1-omni).
+    one_kind: bool,
+}
+
+impl Media {
+    /// From a model's `modalities` and `family`, as cev's `/v1/models`
+    /// reports them.
+    fn of(modalities: &[String], family: &str) -> Self {
+        let takes = |modality: &str| modalities.iter().any(|m| m == modality);
+        Media {
+            images: takes("image"),
+            audio: takes("audio"),
+            one_kind: family == "d1-omni",
+        }
+    }
+}
+
+/// cev's `GET /v1/models`. Servers before cev 0.2 report neither field, and
+/// take text only.
+#[derive(Deserialize)]
+struct ModelList {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    #[serde(default)]
+    modalities: Vec<String>,
+    #[serde(default)]
+    family: String,
+}
+
+/// What the classifier asks of cev that [`Cev`] can't: labels with a
+/// `weight` and `metadata` ([`Cev::feedback`] sends neither), and what the
+/// model takes.
+enum Direct {
     Http {
         url: String,
         key: Option<String>,
@@ -143,32 +196,28 @@ enum Labels {
     Local(std::sync::Arc<cev_runtime::Cev>),
 }
 
-impl Labels {
-    async fn send(&self, request: FeedbackRequest) -> cev::Result<FeedbackResponse> {
-        let transport = |err: &dyn std::fmt::Display| cev::Error::Transport(err.to_string());
+impl Direct {
+    async fn media(&self) -> cev::Result<Media> {
         match self {
-            Labels::Http { url, key, client } => {
-                let mut post = client.post(format!("{}/v1/feedback", url.trim_end_matches('/'))).json(&request);
-                if let Some(key) = key {
-                    post = post.bearer_auth(key);
-                }
-                let response = post.send().await.map_err(|err| transport(&err))?;
-                let status = response.status();
-                let body = response.text().await.map_err(|err| transport(&err))?;
-                if !status.is_success() {
-                    let message = serde_json::from_str::<Value>(&body)
-                        .ok()
-                        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-                        .unwrap_or(body);
-                    return Err(cev::Error::Api {
-                        status: status.as_u16(),
-                        message,
-                    });
-                }
-                serde_json::from_str(&body).map_err(|err| cev::Error::Protocol(err.to_string()))
+            Direct::Http { url, key, client } => {
+                let list: ModelList = call(client.get(endpoint(url, "models")), key).await?;
+                let model = list.data.first().ok_or_else(|| cev::Error::Protocol("cev lists no model".to_string()))?;
+                Ok(Media::of(&model.modalities, &model.family))
             }
             #[cfg(any(test, feature = "cev-local"))]
-            Labels::Local(runtime) => {
+            Direct::Local(runtime) => {
+                let info = runtime.model_info();
+                Ok(Media::of(&info.modalities, &info.family))
+            }
+        }
+    }
+
+    async fn feedback(&self, request: FeedbackRequest) -> cev::Result<FeedbackResponse> {
+        match self {
+            Direct::Http { url, key, client } => call(client.post(endpoint(url, "feedback")).json(&request), key).await,
+            #[cfg(any(test, feature = "cev-local"))]
+            Direct::Local(runtime) => {
+                let transport = |err: &dyn std::fmt::Display| cev::Error::Transport(err.to_string());
                 use cev_runtime::CevError;
 
                 let runtime = runtime.clone();
@@ -191,6 +240,46 @@ impl Labels {
     }
 }
 
+fn endpoint(url: &str, path: &str) -> String {
+    format!("{}/v1/{path}", url.trim_end_matches('/'))
+}
+
+/// Sends `request` to a cev server, with `key` as its bearer token, and
+/// reads the answer, failing the way [`Cev`] does.
+async fn call<T: DeserializeOwned>(mut request: reqwest::RequestBuilder, key: &Option<String>) -> cev::Result<T> {
+    let transport = |err: reqwest::Error| cev::Error::Transport(err.to_string());
+    if let Some(key) = key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await.map_err(transport)?;
+    let status = response.status();
+    let body = response.text().await.map_err(transport)?;
+    if !status.is_success() {
+        let message = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or(body);
+        return Err(cev::Error::Api {
+            status: status.as_u16(),
+            message,
+        });
+    }
+    serde_json::from_str(&body).map_err(|err| cev::Error::Protocol(err.to_string()))
+}
+
+/// The latest user message with text, an image or audio in it: the turn
+/// whose images and audio cev is shown. Turns of tool results alone are
+/// skipped, as [`latest_user_text`] skips them.
+fn latest_turn(req: &ChatRequest) -> Option<&Message> {
+    req.messages.iter().rev().filter(|m| m.role == Role::User).find(|m| {
+        m.content.iter().any(|part| match part {
+            ContentPart::Text { text } => !text.is_empty(),
+            ContentPart::Image { .. } | ContentPart::Audio { .. } => true,
+            ContentPart::ToolUse { .. } | ContentPart::ToolResult { .. } => false,
+        })
+    })
+}
+
 impl CevClassifier {
     /// Builds the classifier from its `[classifiers.cev]` settings.
     /// `providers` are the configured providers, which every model option
@@ -198,7 +287,7 @@ impl CevClassifier {
     pub fn from_settings(settings: &Map<String, Value>, providers: &[ProviderConfig]) -> anyhow::Result<Self> {
         let settings: Settings = serde_json::from_value(Value::Object(settings.clone()))?;
 
-        let (cev, labels) = match (&settings.url, &settings.model) {
+        let (cev, direct) = match (&settings.url, &settings.model) {
             (Some(url), None) => {
                 let key = match &settings.api_key_env {
                     Some(var) => Some(std::env::var(var).with_context(|| format!("${var} is not set"))?),
@@ -208,22 +297,22 @@ impl CevClassifier {
                     Some(key) => Cev::http(url.as_str()).with_api_key(key.as_str()),
                     None => Cev::http(url.as_str()),
                 };
-                let labels = Labels::Http {
+                let direct = Direct::Http {
                     url: url.clone(),
                     key,
                     client: reqwest::Client::new(),
                 };
-                (cev, labels)
+                (cev, direct)
             }
             (None, Some(model)) => local(model, &settings.db)?,
             _ => bail!("set either `url` (a running cev server) or `model` (to run one in-process)"),
         };
 
         check_models(&settings.models, providers)?;
-        Self::new(cev, labels, settings)
+        Self::new(cev, direct, settings)
     }
 
-    fn new(cev: Cev, labels: Labels, settings: Settings) -> anyhow::Result<Self> {
+    fn new(cev: Cev, direct: Direct, settings: Settings) -> anyhow::Result<Self> {
         if settings.models.len() < 2 {
             bail!("needs at least two `models` to choose between");
         }
@@ -239,7 +328,8 @@ impl CevClassifier {
 
         Ok(CevClassifier {
             cev,
-            labels,
+            direct,
+            takes: OnceCell::new(),
             question: Question {
                 kind: QuestionType::Choice,
                 instructions: settings.instructions,
@@ -249,8 +339,50 @@ impl CevClassifier {
             models: settings.models,
             timeout: Duration::from_millis(settings.timeout_ms),
             max_chars: settings.max_chars,
+            max_images: settings.max_images,
             llm_label_weight: Some(settings.llm_label_weight).filter(|weight| *weight > 0.0),
         })
+    }
+
+    /// The images and audio of the latest user turn that cev's model takes:
+    /// up to `max_images` images it can decode, and a WAV clip. A model
+    /// that takes one kind at a time gets the clip.
+    async fn media(&self, req: &ChatRequest) -> (Vec<String>, Option<String>) {
+        let parts = latest_turn(req).map_or(&[][..], |turn| &turn.content[..]);
+        let mut images: Vec<&String> = parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Image { media_type, data }
+                    if IMAGE_TYPES.iter().any(|t| t.eq_ignore_ascii_case(media_type)) =>
+                {
+                    Some(data)
+                }
+                _ => None,
+            })
+            .take(self.max_images)
+            .collect();
+        let mut audio = parts.iter().find_map(|part| match part {
+            ContentPart::Audio { format, data } if format.eq_ignore_ascii_case("wav") => Some(data),
+            _ => None,
+        });
+        if images.is_empty() && audio.is_none() {
+            return (Vec::new(), None);
+        }
+
+        let takes = match self.takes.get_or_try_init(|| self.direct.media()).await {
+            Ok(takes) => *takes,
+            Err(err) => {
+                tracing::warn!("sending cev text only: can't tell whether its model takes images or audio: {err}");
+                return (Vec::new(), None);
+            }
+        };
+        if !takes.audio {
+            audio = None;
+        }
+        if !takes.images || (takes.one_kind && audio.is_some()) {
+            images.clear();
+        }
+        (images.into_iter().cloned().collect(), audio.cloned())
     }
 
     /// What cev is shown of `req`: the system prompt and the latest user
@@ -331,30 +463,50 @@ impl CevClassifier {
             comment,
             metadata: Some(metadata),
         };
-        tokio::time::timeout(self.timeout, self.labels.send(request))
+        tokio::time::timeout(self.timeout, self.direct.feedback(request))
             .await
             .map_err(|_| cev::Error::Transport(format!("no answer from cev within {:?}", self.timeout)))?
     }
 }
 
 #[cfg(feature = "cev-local")]
-fn local(model: &str, db: &str) -> anyhow::Result<(Cev, Labels)> {
+fn local(model: &str, db: &str) -> anyhow::Result<(Cev, Direct)> {
     use std::sync::Arc;
 
-    use cev_model::{Engine, EngineOptions};
+    use cev_model::EngineOptions;
     use cev_runtime::{RuntimeConfig, Store};
 
-    let engine = Engine::load(EngineOptions {
+    // Any model cev runs; which kind it is is told from its files.
+    let backend = cev_model::load(EngineOptions {
         model: model.to_string(),
         ..Default::default()
     })?;
     let store = Store::open(db)?;
-    let runtime = Arc::new(cev_runtime::Cev::new(Arc::new(engine), store, RuntimeConfig::default())?);
-    Ok((Cev::from_runtime(runtime.clone()), Labels::Local(runtime)))
+    let runtime = Arc::new(cev_runtime::Cev::new(backend, store, RuntimeConfig::default())?);
+
+    // A model's first decision can be slow: d1-omni's first on a Mac that
+    // hadn't run it took 22 s, past any sensible `timeout_ms`. Make it now
+    // rather than on a request; once warm it takes milliseconds.
+    let started = std::time::Instant::now();
+    runtime.decide(&serde_json::from_value(json!({
+        "state": "warm-up",
+        "questions": {"q": {"type": "choice", "instructions": "Which?", "criteria": {"a": null, "b": null}}},
+        "no_store": true,
+    }))?)?;
+
+    let info = runtime.model_info();
+    tracing::info!(
+        model = %info.id,
+        family = %info.family,
+        modalities = ?info.modalities,
+        warm_up_ms = started.elapsed().as_millis() as u64,
+        "cev model loaded"
+    );
+    Ok((Cev::from_runtime(runtime.clone()), Direct::Local(runtime)))
 }
 
 #[cfg(not(feature = "cev-local"))]
-fn local(_model: &str, _db: &str) -> anyhow::Result<(Cev, Labels)> {
+fn local(_model: &str, _db: &str) -> anyhow::Result<(Cev, Direct)> {
     bail!(
         "`model` runs cev in-process, which needs a build with `--features cev-local` \
          (or set `url` to use a cev server)"
@@ -368,15 +520,22 @@ impl Classifier for CevClassifier {
     }
 
     async fn classify(&self, _ctx: &ClassifierContext, req: &ChatRequest) -> anyhow::Result<Classification> {
-        let request = SystemOneRequest {
-            state: self.state(req),
-            model: None,
-            questions: IndexMap::from([(QUESTION.to_string(), self.question.clone())]),
-            no_store: false,
-            debias: None,
+        let decide = async {
+            let (images, audio) = self.media(req).await;
+            let request = SystemOneRequest {
+                state: self.state(req),
+                model: None,
+                questions: IndexMap::from([(QUESTION.to_string(), self.question.clone())]),
+                no_store: false,
+                debias: None,
+                namespace: None,
+                images,
+                audio,
+            };
+            self.cev.system_one(request).await
         };
 
-        let response = tokio::time::timeout(self.timeout, self.cev.system_one(request))
+        let response = tokio::time::timeout(self.timeout, decide)
             .await
             .with_context(|| format!("no answer from cev within {:?}", self.timeout))??;
 
@@ -449,6 +608,10 @@ pub(crate) mod tests {
     /// [`mock_classifier`], and the runtime behind it, to look at what it
     /// stored.
     pub(crate) fn mock_classifier_and_runtime() -> (CevClassifier, Arc<cev_runtime::Cev>) {
+        mock_with(MockBackend::default())
+    }
+
+    fn mock_with(backend: MockBackend) -> (CevClassifier, Arc<cev_runtime::Cev>) {
         let settings: Settings = serde_json::from_value(json!({"models": [
             {
                 "provider": "ollama",
@@ -464,9 +627,9 @@ pub(crate) mod tests {
         ]}))
         .unwrap();
         let store = Store::in_memory().unwrap();
-        let runtime = cev_runtime::Cev::new(Arc::new(MockBackend::default()), store, RuntimeConfig::default()).unwrap();
+        let runtime = cev_runtime::Cev::new(Arc::new(backend), store, RuntimeConfig::default()).unwrap();
         let runtime = Arc::new(runtime);
-        let classifier = CevClassifier::new(Cev::from_runtime(runtime.clone()), Labels::Local(runtime.clone()), settings);
+        let classifier = CevClassifier::new(Cev::from_runtime(runtime.clone()), Direct::Local(runtime.clone()), settings);
         (classifier.unwrap(), runtime)
     }
 
@@ -491,10 +654,158 @@ pub(crate) mod tests {
     }
 
     async fn route(classifier: &CevClassifier, content: &str) -> RouteChoice {
+        route_request(classifier, &request(content)).await
+    }
+
+    async fn route_request(classifier: &CevClassifier, req: &ChatRequest) -> RouteChoice {
         let ctx = ClassifierContext {
             settings: Default::default(),
         };
-        classifier.classify(&ctx, &request(content)).await.unwrap().route.unwrap()
+        classifier.classify(&ctx, req).await.unwrap().route.unwrap()
+    }
+
+    fn image(media_type: &str, data: &str) -> ContentPart {
+        ContentPart::Image {
+            media_type: media_type.to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    fn audio(format: &str, data: &str) -> ContentPart {
+        ContentPart::Audio {
+            format: format.to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    /// A request whose latest user turn has two PNGs, a HEIC cev can't
+    /// decode, and a WAV clip.
+    fn media_request() -> ChatRequest {
+        let mut req = request("Is this code or a recipe?");
+        req.messages[0].content.extend([
+            image("image/png", "iVBORw0KGgo="),
+            image("image/heic", "AAAAGGZ0eXA="),
+            image("image/PNG", "iVBORw0KGgoA"),
+            audio("mp3", "SUQz"),
+            audio("wav", "UklGRg=="),
+        ]);
+        req
+    }
+
+    #[tokio::test]
+    async fn sends_media_only_to_a_model_that_takes_it() {
+        let both = (vec!["iVBORw0KGgo=".to_string(), "iVBORw0KGgoA".to_string()], Some("UklGRg==".to_string()));
+
+        // cev would refuse the request if they were sent.
+        let (text_only, _) = mock_with(MockBackend::default());
+        assert_eq!(text_only.media(&media_request()).await, (Vec::new(), None));
+        route_request(&text_only, &media_request()).await;
+
+        let (takes_media, _) = mock_with(MockBackend::default().with_media());
+        assert_eq!(takes_media.media(&media_request()).await, both);
+        route_request(&takes_media, &media_request()).await;
+
+        let with = |takes: Media, max_images: usize| {
+            let (mut classifier, _) = mock_with(MockBackend::default());
+            classifier.takes = OnceCell::new_with(Some(takes));
+            classifier.max_images = max_images;
+            classifier
+        };
+        let images = Media {
+            images: true,
+            audio: false,
+            one_kind: false,
+        };
+        assert_eq!(with(images, 4).media(&media_request()).await, (both.0.clone(), None));
+        assert_eq!(with(images, 1).media(&media_request()).await, (vec![both.0[0].clone()], None));
+        assert_eq!(with(images, 0).media(&media_request()).await, (Vec::new(), None));
+
+        // d1-omni takes one kind at a time, and gets the clip.
+        let d1_omni = Media {
+            images: true,
+            audio: true,
+            one_kind: true,
+        };
+        assert_eq!(with(d1_omni, 4).media(&media_request()).await, (Vec::new(), both.1.clone()));
+        let mut no_clip = media_request();
+        no_clip.messages[0].content.pop();
+        assert_eq!(with(d1_omni, 4).media(&no_clip).await, (both.0.clone(), None));
+    }
+
+    #[tokio::test]
+    async fn sends_the_media_of_the_latest_user_turn() {
+        let (classifier, _) = mock_with(MockBackend::default().with_media());
+        let png = || image("image/png", "iVBORw0KGgo=");
+
+        // A tool result isn't a turn of its own; a later question is.
+        let mut req = request("What is in this picture?");
+        req.messages[0].content.push(png());
+        req.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentPart::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "ok".to_string(),
+            }],
+        });
+        assert_eq!(classifier.media(&req).await.0.len(), 1);
+        req.messages.push(Message::text(Role::Assistant, "A cat."));
+        req.messages.push(Message::text(Role::User, "What breed?"));
+        assert_eq!(classifier.media(&req).await.0.len(), 0);
+
+        // A picture sent on its own is still the latest turn.
+        req.messages.push(Message {
+            role: Role::User,
+            content: vec![png()],
+        });
+        assert_eq!(classifier.media(&req).await.0.len(), 1);
+        assert_eq!(classifier.state(&req)["request"], "What breed?");
+    }
+
+    #[tokio::test]
+    async fn asks_a_cev_server_once_what_its_model_takes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{Json, routing::get};
+
+        async fn server(model: Value) -> (CevClassifier, Arc<AtomicUsize>) {
+            let asked = Arc::new(AtomicUsize::new(0));
+            let count = asked.clone();
+            let app = axum::Router::new().route(
+                "/v1/models",
+                get(move || async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"object": "list", "data": [model]}))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let (mock, _) = mock_classifier_and_runtime();
+            let direct = Direct::Http {
+                url: url.clone(),
+                key: None,
+                client: reqwest::Client::new(),
+            };
+            let settings = Settings {
+                models: mock.models,
+                ..Default::default()
+            };
+            (CevClassifier::new(Cev::http(url), direct, settings).unwrap(), asked)
+        }
+
+        let d1_omni = json!({"id": "cev-d1-omni-600m", "family": "d1-omni", "modalities": ["text", "image", "audio"]});
+        let (classifier, asked) = server(d1_omni).await;
+        assert_eq!(classifier.media(&request("no media here")).await, (Vec::new(), None));
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+        for _ in 0..2 {
+            assert_eq!(classifier.media(&media_request()).await, (Vec::new(), Some("UklGRg==".to_string())));
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        // A server from before cev 0.2 says neither, and takes text only.
+        let (classifier, _) = server(json!({"id": "cev-qwen3-1.7b", "object": "model"})).await;
+        assert_eq!(classifier.media(&media_request()).await, (Vec::new(), None));
     }
 
     #[tokio::test]
@@ -621,7 +932,7 @@ pub(crate) mod tests {
         let url = format!("http://{}/", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let labels = Labels::Http {
+        let direct = Direct::Http {
             url,
             key: Some("secret".to_string()),
             client: reqwest::Client::new(),
@@ -636,14 +947,14 @@ pub(crate) mod tests {
             metadata: Some(json!({"source": "llm"})),
         };
 
-        let learned = labels.send(label("dec_1")).await.unwrap();
+        let learned = direct.feedback(label("dec_1")).await.unwrap();
         assert_eq!(learned.task_examples, 3);
         let (auth, body) = received.lock().unwrap()[0].clone();
         assert_eq!(auth, "Bearer secret");
         assert_eq!(body, json!({"decision_id": "dec_1", "label": "general", "weight": 0.5, "metadata": {"source": "llm"}}));
 
         // The server's errors come back as cev's would.
-        let err = labels.send(label("dec_missing")).await.unwrap_err();
+        let err = direct.feedback(label("dec_missing")).await.unwrap_err();
         assert!(matches!(&err, cev::Error::Api { status: 404, message } if message == "decision not found"), "{err}");
     }
 

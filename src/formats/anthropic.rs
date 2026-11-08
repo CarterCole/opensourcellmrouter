@@ -106,20 +106,24 @@ fn anthropic_content_from_parts(parts: &[ContentPart]) -> AnthropicContent {
     AnthropicContent::Blocks(
         parts
             .iter()
-            .map(|part| match part {
-                ContentPart::Text { text } => ContentBlock::Text { text: text.clone() },
-                ContentPart::Image { media_type, data } => ContentBlock::Image {
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(ContentBlock::Text { text: text.clone() }),
+                ContentPart::Image { media_type, data } => Some(ContentBlock::Image {
                     source: ImageSource {
                         source_type: "base64".to_string(),
                         media_type: media_type.clone(),
                         data: data.clone(),
                     },
-                },
+                }),
+                ContentPart::Audio { .. } => {
+                    tracing::warn!("dropping audio from a request to an Anthropic-format provider, which takes none");
+                    None
+                }
                 ContentPart::ToolUse { id, name, input } => {
-                    ContentBlock::ToolUse { id: id.clone(), name: name.clone(), input: input.clone() }
+                    Some(ContentBlock::ToolUse { id: id.clone(), name: name.clone(), input: input.clone() })
                 }
                 ContentPart::ToolResult { tool_use_id, content } => {
-                    ContentBlock::ToolResult { tool_use_id: tool_use_id.clone(), content: content.clone() }
+                    Some(ContentBlock::ToolResult { tool_use_id: tool_use_id.clone(), content: content.clone() })
                 }
             })
             .collect(),
@@ -963,6 +967,14 @@ mod tests {
             AnthropicContent::Text(text) => assert_eq!(text, "hi"),
             AnthropicContent::Blocks(_) => panic!("expected bare string content"),
         }
+    }
+
+    #[test]
+    fn outbound_drops_audio() {
+        let mut chat = chat_request(None, None, None, None);
+        chat.messages[0].content.push(ContentPart::Audio { format: "wav".to_string(), data: "UklGRg==".to_string() });
+        let req = AnthropicMessagesRequest::from(&chat);
+        assert_eq!(serde_json::to_value(&req.messages[0].content).unwrap(), json!([{"type": "text", "text": "hi"}]));
     }
 
     #[test]

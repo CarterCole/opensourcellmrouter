@@ -20,7 +20,7 @@ use crate::canonical::{
 };
 
 /// OpenAI message content: either a bare string, or an array of typed
-/// blocks (used for mixed text/image content).
+/// blocks (used for mixed text, image and audio content).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum OpenAiContent {
@@ -33,11 +33,19 @@ pub enum OpenAiContent {
 pub enum OpenAiContentBlock {
     Text { text: String },
     ImageUrl { image_url: OpenAiImageUrl },
+    InputAudio { input_audio: OpenAiInputAudio },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiImageUrl {
     pub url: String,
+}
+
+/// Base64 `data` in `format` (`"wav"` or `"mp3"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiInputAudio {
+    pub data: String,
+    pub format: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +197,10 @@ fn content_parts_from_openai(content: Option<OpenAiContent>) -> Vec<ContentPart>
                 OpenAiContentBlock::Text { text } => Some(ContentPart::Text { text }),
                 OpenAiContentBlock::ImageUrl { image_url } => parse_data_url(&image_url.url)
                     .map(|(media_type, data)| ContentPart::Image { media_type, data }),
+                OpenAiContentBlock::InputAudio { input_audio } => Some(ContentPart::Audio {
+                    format: input_audio.format,
+                    data: input_audio.data,
+                }),
             })
             .collect(),
     }
@@ -212,7 +224,7 @@ fn openai_messages_from_canonical(msg: &Message) -> Vec<OpenAiMessage> {
     };
 
     let mut blocks = Vec::new();
-    let mut has_image = false;
+    let mut has_media = false;
     let mut text_only = String::new();
     let mut tool_calls = Vec::new();
     let mut tool_results = Vec::new();
@@ -224,9 +236,15 @@ fn openai_messages_from_canonical(msg: &Message) -> Vec<OpenAiMessage> {
                 blocks.push(OpenAiContentBlock::Text { text: text.clone() });
             }
             ContentPart::Image { media_type, data } => {
-                has_image = true;
+                has_media = true;
                 blocks.push(OpenAiContentBlock::ImageUrl {
                     image_url: OpenAiImageUrl { url: data_url(media_type, data) },
+                });
+            }
+            ContentPart::Audio { format, data } => {
+                has_media = true;
+                blocks.push(OpenAiContentBlock::InputAudio {
+                    input_audio: OpenAiInputAudio { data: data.clone(), format: format.clone() },
                 });
             }
             ContentPart::ToolUse { id, name, input } => tool_calls.push(OpenAiToolCall {
@@ -245,7 +263,7 @@ fn openai_messages_from_canonical(msg: &Message) -> Vec<OpenAiMessage> {
 
     let mut out = Vec::new();
     if !blocks.is_empty() || !tool_calls.is_empty() {
-        let content = if has_image {
+        let content = if has_media {
             Some(OpenAiContent::Blocks(blocks))
         } else if !text_only.is_empty() {
             Some(OpenAiContent::Text(text_only))
@@ -832,6 +850,28 @@ mod tests {
             chat.messages[0].content,
             vec![ContentPart::Image { media_type: "image/png".to_string(), data: "abc123".to_string() }]
         );
+    }
+
+    #[test]
+    fn input_audio_block_maps_to_audio_part_and_back() {
+        let message = json!({"role": "user", "content": [
+            {"type": "text", "text": "what is said here?"},
+            {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}},
+        ]});
+        let req: OpenAiChatRequest =
+            serde_json::from_value(json!({"model": "gpt-4o-audio-preview", "messages": [message]})).unwrap();
+
+        let chat: ChatRequest = req.into();
+        assert_eq!(
+            chat.messages[0].content,
+            vec![
+                ContentPart::Text { text: "what is said here?".to_string() },
+                ContentPart::Audio { format: "wav".to_string(), data: "UklGRg==".to_string() },
+            ]
+        );
+
+        let outbound = OpenAiChatRequest::from(&chat);
+        assert_eq!(serde_json::to_value(&outbound.messages[0]).unwrap(), message);
     }
 
     #[test]

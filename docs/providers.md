@@ -4,7 +4,9 @@ Each `[[providers]]` entry in `config.toml` is an upstream LLM backend.
 `src/provider.rs` translates the canonical `ChatRequest`/`ChatResponse`
 (`src/canonical.rs`) to and from whichever wire format the provider speaks,
 based on its `format`. Every format supports both plain and streaming
-(`stream: true`) requests.
+(`stream: true`) requests, and inline (base64) images. Audio, which only
+OpenAI-format clients can send (`input_audio`), reaches only `openai`
+providers; the others drop it and log a warning.
 
 ```toml
 [[providers]]

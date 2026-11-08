@@ -29,6 +29,13 @@ pub enum ContentPart {
         media_type: String,
         data: String,
     },
+    /// An audio clip. `data` is base64-encoded; `format` is its encoding as
+    /// OpenAI's `input_audio` names it (`"wav"` or `"mp3"`). Only
+    /// OpenAI-format providers take audio; the others drop it.
+    Audio {
+        format: String,
+        data: String,
+    },
     /// An assistant requesting a tool call.
     ToolUse {
         id: String,
@@ -60,7 +67,7 @@ impl Message {
         }
     }
 
-    /// Joins every `Text` part's text, skipping images/tool parts. Used by
+    /// Joins every `Text` part's text, skipping media and tool parts. Used by
     /// anything that only cares about the textual content of a message,
     /// e.g. keyword classification.
     pub fn text_content(&self) -> String {
@@ -309,6 +316,15 @@ mod tests {
     }
 
     #[test]
+    fn audio_part_serializes_as_tagged_shape() {
+        let part = ContentPart::Audio { format: "wav".to_string(), data: "UklGRg==".to_string() };
+        assert_eq!(
+            serde_json::to_value(&part).unwrap(),
+            json!({"type": "audio", "format": "wav", "data": "UklGRg=="})
+        );
+    }
+
+    #[test]
     fn tool_use_part_serializes_as_tagged_shape() {
         let part = ContentPart::ToolUse {
             id: "call_1".to_string(),
@@ -335,6 +351,7 @@ mod tests {
         for part in [
             ContentPart::Text { text: "hi".to_string() },
             ContentPart::Image { media_type: "image/png".to_string(), data: "abc".to_string() },
+            ContentPart::Audio { format: "mp3".to_string(), data: "abc".to_string() },
             ContentPart::ToolUse { id: "1".to_string(), name: "f".to_string(), input: json!({}) },
             ContentPart::ToolResult { tool_use_id: "1".to_string(), content: "r".to_string() },
         ] {
@@ -370,6 +387,7 @@ mod tests {
             content: vec![
                 ContentPart::Text { text: "describe this".to_string() },
                 ContentPart::Image { media_type: "image/png".to_string(), data: "abc".to_string() },
+                ContentPart::Audio { format: "wav".to_string(), data: "abc".to_string() },
                 ContentPart::ToolUse { id: "1".to_string(), name: "f".to_string(), input: json!({}) },
                 ContentPart::ToolResult { tool_use_id: "1".to_string(), content: "r".to_string() },
             ],

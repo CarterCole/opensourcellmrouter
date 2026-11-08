@@ -83,7 +83,9 @@ Asks a [cev](https://github.com/CarterCole/rust-cev) model which of the
 configured models should answer the request, and learns from corrections.
 Each request becomes one cev *choice* question about the system prompt and
 the latest user message; the options are the `models` below, and the answer
-is one of them plus a probability for each. No text is generated.
+is one of them plus a probability for each. No text is generated. If cev's
+model takes images or audio (see [models](#models)), it also gets those
+of the latest user turn.
 
 ```toml
 [classifiers.cev]
@@ -112,13 +114,14 @@ chain decides which rules can override it.
 |---|---|---|
 | `url` | | Base URL of a `cev` server. Set this or `model`. |
 | `api_key_env` | | Environment variable holding the server's bearer token. |
-| `model` | | Qwen3 checkpoint (Hugging Face repo id or directory) to run in-process instead of `url`. |
+| `model` | | Model to run in-process instead of `url`: a short name such as `d1` or `kev:4b`, a Hugging Face repo id, or a directory. See [models](#models). |
 | `db` | `cev.db` | With `model`: SQLite file for decisions, feedback and adapters. |
 | `models` | | The options to choose between (at least two). |
 | `instructions` | "Which model is best suited to answer this request?" | The question. |
 | `task` | `llmrouter.route` | Key of the online adapter that learns from feedback. |
 | `timeout_ms` | `5000` | How long to wait for cev before routing without it. |
 | `max_chars` | `2000` | How much of the system prompt and of the message to send. |
+| `max_images` | `4` | Most images to send, for a model that takes them. `0` sends none. |
 | `llm_label_weight` | `1.0` | Weight of a label taken from an [`llm`](#llm) pick, against 1 for a correction. `0` takes none. See [learning from `llm`](#learning-from-llm). |
 
 Each of `models` has a `provider` and `model` to route to, an optional
@@ -127,8 +130,7 @@ and an optional `name` to pick and label it by, which defaults to `model`.
 
 **Server or in-process.** With `url`, picks come from a `cev` server
 (`cargo install cev-server --features metal`). With `model`, the router
-loads the checkpoint itself, which needs a build with the `cev-local`
-feature:
+loads the model itself, which needs a build with the `cev-local` feature:
 
 ```bash
 cargo run --release --features cev-local
@@ -160,6 +162,36 @@ cev decides every request whether or not its pick routes it — with no
 `cev` rule in `routers`, or one whose `min_confidence` it falls short of,
 or another rule ahead of it — so every request still has a decision id to
 correct.
+
+#### Models
+
+`model`, like a cev server's `--model`, can be any model cev runs, named by
+a short name, a Hugging Face repo id or a directory. Weights come from the
+Hugging Face cache, or are downloaded the first time. All of them take text,
+and some take more:
+
+| `model` | Takes | Per pick, through the router on an M4 Max |
+|---|---|---|
+| `Qwen/Qwen3-*` | text | 0.05 s (`Qwen/Qwen3-0.6B`) |
+| `Qwen/Qwen3.5-*` | text, images | 0.4–1 s; 2 s with an image (`Qwen/Qwen3.5-0.8B`) |
+| `kev` (`kev:0.8b`, `:4b`, `:9b`) | text | 0.1 s (`kev:0.8b`) |
+| `nimble-v3` (`:9b`, `:27b`) | text | 2–2.5 s (`nimble-v3`, 9B) |
+| `d3` (`d3:2b`, `:4b`, `:8b`, `:27b`) | text, images | 0.15 s; 2–3 s with an image (`d3:2b`) |
+| `d1` (`d1:2b`, `:3b`) | text, images | 0.1–0.35 s; 1.5–2.5 s with an image (`d1:3b`) |
+| `d1-omni` (`:600m`, `:2b`) | text, and images or audio | 0.03 s; 0.1 s with an image, 2–3 s with 10 s of audio (`d1-omni`) |
+
+A model that takes images gets the latest user turn's PNG, JPEG, WebP and
+GIF images, up to `max_images`; one that takes audio gets its clip, if it's
+a WAV (OpenAI's `input_audio` with `"format": "wav"`). d1-omni takes images
+or audio but not both, and gets the audio when a turn has both. With `url`,
+the router asks the server's `/v1/models` what its model takes the first
+time a request has images or audio; a server older than cev 0.2 is sent
+text only.
+
+A model's first decision can be slow: d1-omni's first, on a Mac that hadn't
+run it before, took 22 s, and later ones a few milliseconds. Loading a model
+in-process ends with one decision, so that wait comes at startup rather than
+on a request (which `timeout_ms` would route without a pick).
 
 #### Learning from `llm`
 
@@ -310,11 +342,10 @@ rewrite_model = "gpt-4o"
 3. Document its `id()`, any `[classifiers.<id>]` settings it reads via
    `ctx.settings`, and the tags it can produce.
 
-More sophisticated classifiers — e.g. an actual vision/audio modality
-detector (which would need `canonical::Message` to carry multimodal content
-blocks, not just `String`), or an ML-based moderation call — fit the same
-trait; `keyword` is deliberately the simplest possible implementation to
-build against.
+More sophisticated classifiers — e.g. a modality detector reading the
+`Image` and `Audio` parts of `canonical::Message`, as `cev` does, or an
+ML-based moderation call — fit the same trait; `keyword` is deliberately
+the simplest possible implementation to build against.
 
 ## Response classifiers
 

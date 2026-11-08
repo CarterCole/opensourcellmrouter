@@ -174,6 +174,9 @@ fn ollama_messages_from_canonical(msg: &Message) -> Vec<OllamaMessage> {
             // Ollama only accepts inline base64 images (no media-type tag);
             // since our canonical Image is already base64, this is lossless.
             ContentPart::Image { data, .. } => images.push(data.clone()),
+            ContentPart::Audio { .. } => {
+                tracing::warn!("dropping audio from a request to an Ollama provider, which takes none");
+            }
             ContentPart::ToolUse { name, input, .. } => tool_calls.push(OllamaToolCall {
                 function: OllamaFunctionCall { name: name.clone(), arguments: input.clone() },
             }),
@@ -419,6 +422,22 @@ mod tests {
         assert_eq!(ollama_req.messages[0].images, vec!["abc123".to_string()]);
         let tool_calls = ollama_req.messages[0].tool_calls.as_ref().expect("tool_calls set");
         assert_eq!(tool_calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn request_drops_audio() {
+        let msg = Message {
+            role: Role::User,
+            content: vec![
+                ContentPart::Text { text: "what is said here?".to_string() },
+                ContentPart::Audio { format: "wav".to_string(), data: "UklGRg==".to_string() },
+            ],
+        };
+
+        let ollama_req = OllamaChatRequest::from(&base_request(vec![msg]));
+        assert_eq!(ollama_req.messages.len(), 1);
+        assert_eq!(ollama_req.messages[0].content, "what is said here?");
+        assert!(ollama_req.messages[0].images.is_empty());
     }
 
     #[test]
