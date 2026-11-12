@@ -21,7 +21,8 @@ placeholder value works for the "API key" env vars each tool requires
 below. If you've set `[server] api_key_env` (see
 [`docs/security.md`](security.md) — required if `host = "0.0.0.0"`, e.g.
 to reach the router from another machine via `launch-coding-agent.sh`),
-use that key's actual value instead of `dummy` in every snippet below.
+use that key's actual value instead of `dummy` in every snippet below;
+`launch-coding-agent.sh` sends `$ROUTER_API_KEY` when it's set.
 
 ## Quick start: `launch-coding-agent.sh`
 

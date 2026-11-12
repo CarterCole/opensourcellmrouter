@@ -9,6 +9,10 @@
 # host:port defaults to localhost:8090 (this repo's default router port),
 # but can point at a router running on another machine, e.g.:
 #   ./launch-coding-agent.sh claude 192.168.1.50:8090
+#
+# If the router has an API key ([server] api_key_env), set ROUTER_API_KEY to
+# it and the tool sends it; otherwise a placeholder goes. Traffic is plain
+# HTTP, so over a network you don't trust put TLS in front of the router.
 set -euo pipefail
 
 usage() {
@@ -27,21 +31,23 @@ if [ "${1:-}" != "" ] && [ "${1:-}" != "--" ]; then
 fi
 [ "${1:-}" = "--" ] && shift
 
+KEY="${ROUTER_API_KEY:-dummy}"
+
 case "$TOOL" in
 claude)
     export ANTHROPIC_BASE_URL="http://${ADDR}"
-    export ANTHROPIC_AUTH_TOKEN="dummy"
+    export ANTHROPIC_AUTH_TOKEN="$KEY"
     exec claude "$@"
     ;;
 copilot)
     export COPILOT_PROVIDER_BASE_URL="http://${ADDR}/v1"
     export COPILOT_PROVIDER_TYPE="openai"
-    export COPILOT_PROVIDER_API_KEY="dummy"
+    export COPILOT_PROVIDER_API_KEY="$KEY"
     : "${COPILOT_MODEL:?set COPILOT_MODEL to a model name your router config can resolve}"
     exec copilot "$@"
     ;;
 codex)
-    export LOCAL_ROUTER_DUMMY_KEY="dummy"
+    export LOCAL_ROUTER_DUMMY_KEY="$KEY"
     exec codex \
         -c model_provider='"local-router"' \
         -c 'model_providers.local-router.name="local-router"' \

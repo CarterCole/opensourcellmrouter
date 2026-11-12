@@ -291,6 +291,8 @@ The feed emits four event types per request — `start`, `classified`, `routed`,
 opensourcellmrouter tui http://localhost:8090
 ```
 
+If the router has an API key (`[server] api_key_env`), set `ROUTER_API_KEY` to it first; `watch` reads it too.
+
 Three-pane UI: live pipeline feed (top), running stats by provider/tag (bottom-left), built-in chat client (bottom-right). Keys: `Tab`/`i` to focus chat, `↑↓` to scroll feed, `q` to quit.
 
 ### Watch mode

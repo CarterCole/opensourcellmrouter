@@ -51,9 +51,12 @@ pub struct AppState {
     /// Monotonically increasing request id, used to correlate Start/Complete.
     pub next_id: Arc<AtomicU64>,
     /// Key clients must present to reach any route other than `/health`, if
-    /// `[server] api_key_env` is set — see [`require_api_key`]. `None` means
-    /// the server is unauthenticated.
+    /// `[server] api_key_env` is set — see [`authorize`]. `None` means the
+    /// server is unauthenticated.
     pub api_key: Option<String>,
+    /// Host names an unauthenticated server answers to besides `localhost`
+    /// and IP addresses (`[server] allowed_hosts`) — see [`host_allowed`].
+    pub allowed_hosts: Vec<String>,
 }
 
 pub fn build_app(state: AppState, dashboard: bool) -> AxumRouter {
@@ -69,13 +72,15 @@ pub fn build_app(state: AppState, dashboard: bool) -> AxumRouter {
             .route("/dashboard/events", get(dashboard_events));
     }
 
-    let protected = protected.route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
+    let protected = protected.route_layer(middleware::from_fn_with_state(state.clone(), authorize));
 
-    AxumRouter::new()
-        .route("/health", get(health))
-        .merge(protected)
-        .with_state(state)
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+    // The request span records the path but not the query string, which can
+    // carry `?api_key=` (see `presented_key`).
+    let trace = tower_http::trace::TraceLayer::new_for_http().make_span_with(|req: &Request| {
+        tracing::debug_span!("request", method = %req.method(), path = %req.uri().path(), version = ?req.version())
+    });
+
+    AxumRouter::new().route("/health", get(health)).merge(protected).with_state(state).layer(trace)
 }
 
 /// Pulls the client-presented key out of `Authorization: Bearer <key>`,
@@ -83,10 +88,10 @@ pub fn build_app(state: AppState, dashboard: bool) -> AxumRouter {
 /// for `EventSource`, which can't set custom headers — see
 /// `static/dashboard.html`'s `location.search` passthrough).
 fn presented_key(headers: &HeaderMap, query: &str) -> Option<String> {
-    if let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        if let Some(key) = value.strip_prefix("Bearer ") {
-            return Some(key.to_string());
-        }
+    if let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+        && let Some(key) = value.strip_prefix("Bearer ")
+    {
+        return Some(key.to_string());
     }
     if let Some(value) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(value.to_string());
@@ -99,17 +104,50 @@ fn presented_key(headers: &HeaderMap, query: &str) -> Option<String> {
 }
 
 /// Rejects any request that doesn't present `state.api_key`, when one is
-/// configured. A no-op when `[server] api_key_env` is unset.
-async fn require_api_key(State(state): State<AppState>, req: Request, next: Next) -> Response {
+/// configured. Without one, rejects any request whose `Host` isn't this
+/// machine (see [`host_allowed`]), so that a web page can't reach the
+/// router through DNS rebinding.
+async fn authorize(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let Some(expected) = &state.api_key else {
-        return next.run(req).await;
+        let host = req.headers().get(header::HOST).map(|v| v.to_str().unwrap_or("")).or_else(|| req.uri().host());
+        return match host {
+            Some(host) if !host_allowed(host, &state.allowed_hosts) => ApiError::UnknownHost.into_response(),
+            _ => next.run(req).await,
+        };
     };
 
     let query = req.uri().query().unwrap_or("");
     match presented_key(req.headers(), query) {
-        Some(key) if key == *expected => next.run(req).await,
+        Some(key) if keys_match(&key, expected) => next.run(req).await,
         _ => ApiError::Unauthorized.into_response(),
     }
+}
+
+/// Whether `presented` is `expected`, taking as long to say no whichever
+/// byte differs, so a client can't learn the key a byte at a time from how
+/// quickly it's turned away. (It can learn its length.)
+fn keys_match(presented: &str, expected: &str) -> bool {
+    let (presented, expected) = (presented.as_bytes(), expected.as_bytes());
+    presented.len() == expected.len()
+        && std::hint::black_box(presented.iter().zip(expected).fold(0u8, |diff, (a, b)| diff | (a ^ b))) == 0
+}
+
+/// Whether `host`, a `Host` header (port optional), names this machine: an
+/// IP address, `localhost` or a `*.localhost` name, or one of `allowed`.
+///
+/// A web page that DNS rebinding has pointed at the router sends its own
+/// domain here, while an address in the URL can't be rebound — and a page
+/// fetching `http://127.0.0.1:…` directly is cross-origin, so it can't read
+/// the reply, and the JSON endpoints' preflight fails.
+fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let Ok(authority) = host.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    let name = authority.host().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    name.parse::<std::net::IpAddr>().is_ok()
+        || name == "localhost"
+        || name.ends_with(".localhost")
+        || allowed.iter().any(|a| a.eq_ignore_ascii_case(&name))
 }
 
 async fn health() -> &'static str {
@@ -125,7 +163,7 @@ async fn dashboard_events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = BroadcastStream::new(state.events.subscribe())
-        .filter_map(|msg| msg.ok().map(|line| Ok(Event::default().data(line.to_string()))));
+        .filter_map(|msg| msg.ok().map(|line| Ok(Event::default().data(&*line))));
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
@@ -137,6 +175,9 @@ enum ApiError {
     Plugin(&'static str, anyhow::Error),
     NoResponse,
     Unauthorized,
+    /// An unauthenticated server was reached by a host name it doesn't
+    /// answer to (see [`host_allowed`]).
+    UnknownHost,
     /// Feedback for the `cev` classifier couldn't be recorded.
     Feedback(StatusCode, String),
 }
@@ -160,6 +201,12 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "missing or invalid API key".to_string(),
+            ),
+            ApiError::UnknownHost => (
+                StatusCode::FORBIDDEN,
+                "this router answers requests addressed to localhost or an IP address; add other host names \
+                 to [server] allowed_hosts, or set [server] api_key_env"
+                    .to_string(),
             ),
             ApiError::Feedback(status, message) => (status, message),
         };
@@ -245,10 +292,10 @@ fn broadcast(state: &AppState, event: &RouterEvent) {
         }
     };
 
-    if let Some(logger) = &state.logger {
-        if matches!(event, RouterEvent::Complete { .. }) {
-            logger.log_line(&line);
-        }
+    if let Some(logger) = &state.logger
+        && matches!(event, RouterEvent::Complete { .. })
+    {
+        logger.log_line(&line);
     }
 
     let _ = state.events.send(Arc::from(line));
@@ -854,6 +901,106 @@ mod tests {
         assert_eq!(presented_key(&headers, "api_key=from-query"), Some("from-header".to_string()));
     }
 
+    #[test]
+    fn keys_match_only_the_same_key() {
+        assert!(keys_match("secret123", "secret123"));
+        assert!(!keys_match("secret124", "secret123"));
+        assert!(!keys_match("secret12", "secret123"));
+        assert!(!keys_match("", "secret123"));
+    }
+
+    #[test]
+    fn host_allowed_takes_this_machine_by_address_or_localhost() {
+        for host in ["127.0.0.1", "127.0.0.1:8090", "[::1]:8090", "192.168.1.50:8090", "localhost:8090", "LocalHost", "app.localhost:8090"] {
+            assert!(host_allowed(host, &[]), "{host}");
+        }
+    }
+
+    #[test]
+    fn host_allowed_turns_away_other_names_unless_listed() {
+        for host in ["evil.example:8090", "evil.example", "localhost.evil.example", "", "not a host"] {
+            assert!(!host_allowed(host, &[]), "{host}");
+        }
+        let allowed = vec!["router.lan".to_string()];
+        assert!(host_allowed("Router.LAN:8090", &allowed));
+        assert!(!host_allowed("evil.example:8090", &allowed));
+    }
+
+    /// An app with one OpenAI-format provider at `provider`, and `api_key`.
+    fn app_with_key(provider: &str, api_key: Option<&str>) -> AxumRouter {
+        let config: Config = toml::from_str(&format!(
+            r#"
+            [[providers]]
+            name = "ollama"
+            format = "openai"
+            base_url = "{provider}/v1"
+
+            [[routers]]
+            type = "fallback"
+            "#
+        ))
+        .unwrap();
+        let state = AppState {
+            router: Arc::new(ModelRouter::from_config(&config).unwrap()),
+            client: reqwest::Client::new(),
+            logger: None,
+            plugins: Arc::new(PluginRegistry::from_config(&config)),
+            classifiers: Arc::new(ClassifierRegistry::from_config(&config).unwrap()),
+            response_classifiers: Arc::new(ResponseClassifierRegistry::from_config(&config)),
+            events: broadcast::channel(8).0,
+            in_flight: Arc::new(AtomicU64::new(0)),
+            next_id: Arc::new(AtomicU64::new(0)),
+            api_key: api_key.map(str::to_string),
+            allowed_hosts: Vec::new(),
+        };
+        build_app(state, true)
+    }
+
+    /// Status of `POST /v1/chat/completions` on `router`, sent with `Host:
+    /// host` and `headers`.
+    async fn status_for(router: &str, host: &str, headers: &[(&str, &str)]) -> StatusCode {
+        let mut request = reqwest::Client::new()
+            .post(format!("{router}/v1/chat/completions"))
+            .header(header::HOST, host)
+            .json(&json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.send().await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_router_only_answers_to_this_machine() {
+        let router = serve(app_with_key(&echo_model_provider().await, None)).await;
+
+        assert_eq!(status_for(&router, "localhost:8090", &[]).await, StatusCode::OK);
+        assert_eq!(status_for(&router, "127.0.0.1:8090", &[]).await, StatusCode::OK);
+        assert_eq!(status_for(&router, "evil.example:8090", &[]).await, StatusCode::FORBIDDEN);
+
+        // The dashboard feed too, which carries every prompt.
+        let resp = reqwest::Client::new()
+            .get(format!("{router}/dashboard/events"))
+            .header(header::HOST, "evil.example:8090")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // /health answers anyone.
+        let resp =
+            reqwest::Client::new().get(format!("{router}/health")).header(header::HOST, "evil.example").send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_router_answers_any_name_with_the_key() {
+        let router = serve(app_with_key(&echo_model_provider().await, Some("secret123"))).await;
+
+        assert_eq!(status_for(&router, "router.example:8090", &[("x-api-key", "secret123")]).await, StatusCode::OK);
+        assert_eq!(status_for(&router, "router.example:8090", &[("x-api-key", "secret124")]).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_for(&router, "localhost:8090", &[]).await, StatusCode::UNAUTHORIZED);
+    }
+
     /// Serves `app` on a free local port and returns its base URL.
     async fn serve(app: AxumRouter) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -925,6 +1072,7 @@ mod tests {
             in_flight: Arc::new(AtomicU64::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),
             api_key: None,
+            allowed_hosts: Vec::new(),
         };
         let router = serve(build_app(state, false)).await;
         let client = reqwest::Client::new();
@@ -1011,6 +1159,7 @@ mod tests {
             in_flight: Arc::new(AtomicU64::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),
             api_key: None,
+            allowed_hosts: Vec::new(),
         };
         (serve(build_app(state, false)).await, runtime, logged)
     }
@@ -1145,6 +1294,7 @@ mod tests {
             in_flight: Arc::new(AtomicU64::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),
             api_key: None,
+            allowed_hosts: Vec::new(),
         };
         let router = serve(build_app(state, false)).await;
 
@@ -1294,6 +1444,7 @@ mod tests {
             in_flight: Arc::new(AtomicU64::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),
             api_key: None,
+            allowed_hosts: Vec::new(),
         };
         serve_on_random_port(build_app(state, false)).await
     }

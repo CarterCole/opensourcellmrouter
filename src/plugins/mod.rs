@@ -24,7 +24,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
-use crate::canonical::{ChatRequest, ChatResponse};
+use crate::canonical::{ChatRequest, ChatResponse, PluginRequest};
 use crate::config::Config;
 
 /// Resources and per-request settings handed to a plugin's hooks.
@@ -87,6 +87,15 @@ pub trait Plugin: Send + Sync {
     /// Identifier used in `[plugins.<id>]` config and in a request's
     /// `plugins` array (`{"id": "<id>", ...}`).
     fn id(&self) -> &'static str;
+
+    /// Settings a request's `plugins` entry may set, overriding config —
+    /// e.g. `pareto-router`'s `tier`. Any other key in the entry is ignored:
+    /// settings are the server's to choose unless a plugin says otherwise,
+    /// since some (like `pareto-router`'s `tiers`) would let a client route
+    /// around the `routers` chain.
+    fn request_settings(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// Runs first, before classifiers, on the request as the client sent
     /// it. May mutate `req`, or write a response into `*resp` and return
@@ -182,7 +191,8 @@ impl PluginRegistry {
     /// `req`: every plugin enabled by default in config, in registry order,
     /// followed by any plugins named in `req.plugins` that weren't already
     /// included. A plugin's settings are its config defaults overridden by
-    /// the matching `req.plugins` entry (if any).
+    /// the matching `req.plugins` entry (if any), in the settings the plugin
+    /// lets a request set (see [`Plugin::request_settings`]).
     pub fn resolve(&self, req: &ChatRequest) -> Vec<(Arc<dyn Plugin>, Map<String, Value>)> {
         let mut result = Vec::new();
         let mut included = HashSet::new();
@@ -191,7 +201,7 @@ impl PluginRegistry {
             if entry.enabled_by_default {
                 let mut settings = entry.default_settings.clone();
                 if let Some(req_entry) = req.plugins.iter().find(|p| p.id == entry.plugin.id()) {
-                    settings.extend(req_entry.settings.clone());
+                    apply_request_settings(&mut settings, entry.plugin.as_ref(), req_entry);
                 }
                 included.insert(entry.plugin.id());
                 result.push((entry.plugin.clone(), settings));
@@ -208,11 +218,87 @@ impl PluginRegistry {
             };
             let entry = &self.entries[idx];
             let mut settings = entry.default_settings.clone();
-            settings.extend(req_entry.settings.clone());
+            apply_request_settings(&mut settings, entry.plugin.as_ref(), req_entry);
             included.insert(entry.plugin.id());
             result.push((entry.plugin.clone(), settings));
         }
 
         result
+    }
+}
+
+/// Overrides `settings` with the ones in `req_entry` that `plugin` lets a
+/// request set, ignoring (with a warning) any others.
+fn apply_request_settings(settings: &mut Map<String, Value>, plugin: &dyn Plugin, req_entry: &PluginRequest) {
+    for (key, value) in &req_entry.settings {
+        if plugin.request_settings().contains(&key.as_str()) {
+            settings.insert(key.clone(), value.clone());
+        } else {
+            tracing::warn!("ignoring setting '{key}' for plugin '{}': only config sets it", plugin.id());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn request(plugins: Value) -> ChatRequest {
+        let mut req: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-expensive",
+            "system": null,
+            "messages": [],
+            "max_tokens": null,
+            "temperature": null,
+            "thinking": null,
+            "effort": null,
+            "task_budget": null,
+            "output_schema": null,
+            "stream": false,
+        }))
+        .unwrap();
+        req.plugins = serde_json::from_value(plugins).unwrap();
+        req
+    }
+
+    fn registry(config: &str) -> PluginRegistry {
+        let config: Config = toml::from_str(&format!("providers = []\n{config}")).unwrap();
+        PluginRegistry::from_config(&config)
+    }
+
+    fn settings_of(registry: &PluginRegistry, req: &ChatRequest, id: &str) -> Map<String, Value> {
+        registry.resolve(req).into_iter().find(|(p, _)| p.id() == id).map(|(_, s)| s).unwrap()
+    }
+
+    #[test]
+    fn a_request_picks_a_tier_but_not_what_is_in_it() {
+        let registry = registry(
+            r#"
+            [plugins.pareto-router]
+            enabled = true
+            default_tier = "low"
+
+            [plugins.pareto-router.tiers]
+            low = ["cheap"]
+            "#,
+        );
+        let req = request(json!([{"id": "pareto-router", "tier": "x", "tiers": {"x": ["premium"]}, "default_tier": "x"}]));
+
+        let settings = settings_of(&registry, &req, "pareto-router");
+        assert_eq!(settings["tier"], "x");
+        assert_eq!(settings["default_tier"], "low");
+        assert_eq!(settings["tiers"], json!({"low": ["cheap"]}));
+    }
+
+    #[test]
+    fn a_plugin_only_a_request_enables_gets_no_settings_from_it_but_the_allowed_ones() {
+        let registry = registry("");
+        let req = request(json!([{"id": "pareto-router", "tier": "x", "tiers": {"x": ["premium"]}}]));
+
+        let settings = settings_of(&registry, &req, "pareto-router");
+        assert_eq!(settings.get("tiers"), None);
+        assert_eq!(settings["tier"], "x");
     }
 }

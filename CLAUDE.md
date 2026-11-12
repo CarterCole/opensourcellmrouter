@@ -79,6 +79,7 @@ A `fallback` rule is typically the last entry to ensure every request resolves.
 1. Create `src/plugins/<name>.rs` implementing `Plugin` for a unit struct
 2. Register it in `PluginRegistry::from_config` in `src/plugins/mod.rs`
 3. Document its `id()` and any config settings it reads via `ctx.settings`
+4. List any settings a request's `plugins` entry may override in `request_settings()` (default: none — e.g. `pareto-router` allows `tier` but not `tiers`)
 
 ### Adding a new classifier
 

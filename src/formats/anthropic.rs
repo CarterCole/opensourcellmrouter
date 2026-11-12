@@ -528,10 +528,10 @@ impl AnthropicStreamDecoder {
                     // tool blocks stream `input_json_delta`s too, but aren't
                     // surfaced, so theirs would otherwise land on whichever
                     // tool call the client last saw open.
-                    if let Some(id) = self.tool_use_ids.get(&index) {
-                        if !partial_json.is_empty() {
-                            events.push(StreamEvent::ToolCallDelta { id: id.clone(), partial_input: partial_json });
-                        }
+                    if let Some(id) = self.tool_use_ids.get(&index)
+                        && !partial_json.is_empty()
+                    {
+                        events.push(StreamEvent::ToolCallDelta { id: id.clone(), partial_input: partial_json });
                     }
                 }
                 AnthropicStreamDelta::Other => {}
