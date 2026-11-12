@@ -63,8 +63,7 @@ async fn main() -> anyhow::Result<()> {
         .api_key_env
         .as_ref()
         .map(|var| {
-            std::env::var(var)
-                .with_context(|| format!("[server] api_key_env = \"{var}\" but that variable is not set"))
+            std::env::var(var).with_context(|| format!("[server] api_key_env = \"{var}\" but that variable is not set"))
         })
         .transpose()?;
 
@@ -90,25 +89,14 @@ async fn main() -> anyhow::Result<()> {
         config.server.dashboard,
     );
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("binding to {addr}"))?;
+    let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding to {addr}"))?;
     tracing::info!("opensourcellmrouter listening on {addr}");
     axum::serve(listener, app).await?;
 
     if let Some(otel_state) = otel_state {
-        otel_state
-            .tracer_provider
-            .shutdown()
-            .context("shutting down OTel tracer provider")?;
-        otel_state
-            .meter_provider
-            .shutdown()
-            .context("shutting down OTel meter provider")?;
-        otel_state
-            .logger_provider
-            .shutdown()
-            .context("shutting down OTel logger provider")?;
+        otel_state.tracer_provider.shutdown().context("shutting down OTel tracer provider")?;
+        otel_state.meter_provider.shutdown().context("shutting down OTel meter provider")?;
+        otel_state.logger_provider.shutdown().context("shutting down OTel logger provider")?;
     }
 
     Ok(())
@@ -135,9 +123,7 @@ fn init_telemetry(telemetry: &config::TelemetryConfig) -> anyhow::Result<Option<
         return Ok(None);
     }
 
-    let resource = opentelemetry_sdk::Resource::builder()
-        .with_service_name(telemetry.service_name.clone())
-        .build();
+    let resource = opentelemetry_sdk::Resource::builder().with_service_name(telemetry.service_name.clone()).build();
 
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
@@ -147,9 +133,7 @@ fn init_telemetry(telemetry: &config::TelemetryConfig) -> anyhow::Result<Option<
     let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(span_exporter)
         .with_resource(resource.clone())
-        .with_sampler(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(
-            telemetry.sample_ratio,
-        ))
+        .with_sampler(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(telemetry.sample_ratio))
         .build();
     let tracer = tracer_provider.tracer("opensourcellmrouter");
 
@@ -182,9 +166,5 @@ fn init_telemetry(telemetry: &config::TelemetryConfig) -> anyhow::Result<Option<
         .with(log_bridge)
         .init();
 
-    Ok(Some(OtelState {
-        tracer_provider,
-        meter_provider,
-        logger_provider,
-    }))
+    Ok(Some(OtelState { tracer_provider, meter_provider, logger_provider }))
 }

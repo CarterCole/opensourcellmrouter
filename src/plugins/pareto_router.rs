@@ -41,20 +41,11 @@ impl Plugin for ParetoRouterPlugin {
         req: &mut ChatRequest,
         _resp: &mut Option<ChatResponse>,
     ) -> anyhow::Result<Flow> {
-        let tier = ctx
-            .get_str("tier")
-            .or_else(|| ctx.get_str("default_tier"))
-            .unwrap_or("medium");
+        let tier = ctx.get_str("tier").or_else(|| ctx.get_str("default_tier")).unwrap_or("medium");
 
-        let tiers = ctx
-            .settings
-            .get("tiers")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "pareto-router: no `tiers` configured (e.g. [plugins.pareto-router.tiers])"
-                )
-            })?;
+        let tiers = ctx.settings.get("tiers").and_then(Value::as_object).ok_or_else(|| {
+            anyhow::anyhow!("pareto-router: no `tiers` configured (e.g. [plugins.pareto-router.tiers])")
+        })?;
 
         let providers = tiers.get(tier).and_then(Value::as_array).ok_or_else(|| {
             let known: Vec<&str> = tiers.keys().map(String::as_str).collect();

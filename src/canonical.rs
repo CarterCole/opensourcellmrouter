@@ -61,10 +61,7 @@ impl Message {
     /// plain-text message rather than constructing `ContentPart::Text` by hand.
     #[allow(dead_code)]
     pub fn text(role: Role, text: impl Into<String>) -> Self {
-        Message {
-            role,
-            content: vec![ContentPart::Text { text: text.into() }],
-        }
+        Message { role, content: vec![ContentPart::Text { text: text.into() }] }
     }
 
     /// Joins every `Text` part's text, skipping media and tool parts. Used by
@@ -190,11 +187,7 @@ impl ChatRequest {
     /// non-text content.
     pub fn needed_capabilities(&self) -> Vec<String> {
         let mut needed = Vec::new();
-        if self
-            .messages
-            .iter()
-            .any(|m| m.content.iter().any(|p| matches!(p, ContentPart::Image { .. })))
-        {
+        if self.messages.iter().any(|m| m.content.iter().any(|p| matches!(p, ContentPart::Image { .. }))) {
             needed.push("vision".to_string());
         }
         if !self.tools.is_empty() {
@@ -318,10 +311,7 @@ mod tests {
     #[test]
     fn audio_part_serializes_as_tagged_shape() {
         let part = ContentPart::Audio { format: "wav".to_string(), data: "UklGRg==".to_string() };
-        assert_eq!(
-            serde_json::to_value(&part).unwrap(),
-            json!({"type": "audio", "format": "wav", "data": "UklGRg=="})
-        );
+        assert_eq!(serde_json::to_value(&part).unwrap(), json!({"type": "audio", "format": "wav", "data": "UklGRg=="}));
     }
 
     #[test]
@@ -433,11 +423,8 @@ mod tests {
     #[test]
     fn needed_capabilities_includes_tools_for_non_empty_tools() {
         let mut req = base_request(vec![Message::text(Role::User, "hi")]);
-        req.tools = vec![Tool {
-            name: "get_weather".to_string(),
-            description: None,
-            input_schema: json!({"type": "object"}),
-        }];
+        req.tools =
+            vec![Tool { name: "get_weather".to_string(), description: None, input_schema: json!({"type": "object"}) }];
         assert_eq!(req.needed_capabilities(), vec!["tools".to_string()]);
     }
 
@@ -447,11 +434,8 @@ mod tests {
             role: Role::User,
             content: vec![ContentPart::Image { media_type: "image/png".to_string(), data: "abc".to_string() }],
         }]);
-        req.tools = vec![Tool {
-            name: "get_weather".to_string(),
-            description: None,
-            input_schema: json!({"type": "object"}),
-        }];
+        req.tools =
+            vec![Tool { name: "get_weather".to_string(), description: None, input_schema: json!({"type": "object"}) }];
         assert_eq!(req.needed_capabilities(), vec!["vision".to_string(), "tools".to_string()]);
     }
 }

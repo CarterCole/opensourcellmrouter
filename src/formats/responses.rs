@@ -236,7 +236,10 @@ where
             };
         }
 
-        send!("response.created", json!({"type": "response.created", "response": {"id": response_id, "model": model, "status": "in_progress"}}));
+        send!(
+            "response.created",
+            json!({"type": "response.created", "response": {"id": response_id, "model": model, "status": "in_progress"}})
+        );
 
         let mut item_index: i64 = -1;
         let mut open_item: Option<OpenItem> = None;
@@ -256,7 +259,10 @@ where
                         Some(OpenItem::Message { item_id }) => item_id.clone(),
                         other => {
                             if other.is_some() {
-                                send!("response.output_item.done", json!({"type": "response.output_item.done", "output_index": item_index}));
+                                send!(
+                                    "response.output_item.done",
+                                    json!({"type": "response.output_item.done", "output_index": item_index})
+                                );
                             }
                             item_index += 1;
                             let item_id = format!("msg_{item_index}");
@@ -279,7 +285,10 @@ where
                 }
                 StreamEvent::ToolCallStart { id, name } => {
                     if open_item.is_some() {
-                        send!("response.output_item.done", json!({"type": "response.output_item.done", "output_index": item_index}));
+                        send!(
+                            "response.output_item.done",
+                            json!({"type": "response.output_item.done", "output_index": item_index})
+                        );
                     }
                     item_index += 1;
                     let item_id = format!("fc_{item_index}");
@@ -305,7 +314,10 @@ where
                 }
                 StreamEvent::Done { usage, .. } => {
                     if open_item.is_some() {
-                        send!("response.output_item.done", json!({"type": "response.output_item.done", "output_index": item_index}));
+                        send!(
+                            "response.output_item.done",
+                            json!({"type": "response.output_item.done", "output_index": item_index})
+                        );
                     }
                     send!(
                         "response.completed",
@@ -335,8 +347,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use crate::canonical::{StopReason, ToolCall, Usage};
+    use serde_json::json;
 
     #[test]
     fn inbound_message_items_map_to_canonical_messages() {
@@ -487,7 +499,10 @@ mod tests {
         let events = render_to_events(
             vec![
                 StreamEvent::TextDelta { text: "hi".to_string() },
-                StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: Usage { input_tokens: 1, output_tokens: 2 } },
+                StreamEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage { input_tokens: 1, output_tokens: 2 },
+                },
             ],
             "gpt-5-codex",
         )

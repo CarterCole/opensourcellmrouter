@@ -146,10 +146,10 @@ impl LlmClassifier {
             .iter()
             .find(|p| p.name == settings.provider)
             .with_context(|| format!("`provider` names unknown provider '{}'", settings.provider))?;
-        if let Some(var) = &provider.api_key_env {
-            if !key_is_set(var) {
-                bail!("its provider '{}' needs ${var}, which is not set", provider.name);
-            }
+        if let Some(var) = &provider.api_key_env
+            && !key_is_set(var)
+        {
+            bail!("its provider '{}' needs ${var}, which is not set", provider.name);
         }
 
         check_models(&settings.models, providers)?;
@@ -228,17 +228,14 @@ impl LlmClassifier {
         }
 
         let reply = reply.to_lowercase();
-        let mentioned: Vec<String> = self
-            .models
-            .iter()
-            .map(|m| m.name().to_lowercase())
-            .filter(|name| reply.contains(name.as_str()))
-            .collect();
+        let mentioned: Vec<String> =
+            self.models.iter().map(|m| m.name().to_lowercase()).filter(|name| reply.contains(name.as_str())).collect();
         // A name only mentioned as part of a longer one ("llama3.1:8b" in
         // "llama3.1:8b-instruct") doesn't count.
         let mut named = self.models.iter().filter(|m| {
             let name = m.name().to_lowercase();
-            mentioned.contains(&name) && !mentioned.iter().any(|other| other.len() > name.len() && other.contains(&name))
+            mentioned.contains(&name)
+                && !mentioned.iter().any(|other| other.len() > name.len() && other.contains(&name))
         });
         match (named.next(), named.next()) {
             (Some(only), None) => Some(only),
@@ -439,7 +436,10 @@ pub(crate) mod tests {
         assert_eq!(asked["model"], "router-model");
         assert_eq!(asked["max_tokens"], 64);
         let system = asked["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("- deepseek-r1:latest: Programming and debugging\n- general: Conversation\n"), "{system}");
+        assert!(
+            system.contains("- deepseek-r1:latest: Programming and debugging\n- general: Conversation\n"),
+            "{system}"
+        );
         assert_eq!(
             asked["messages"][1]["content"],
             "<system_prompt>\nBe brief\n</system_prompt>\n<request>\nAny recipes for my travel?\n</request>"

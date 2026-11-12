@@ -45,13 +45,9 @@ impl ModelRouter {
             // Check API key env var if declared. A provider whose key is
             // missing is skipped entirely so requests never get routed to it.
             if let Some(var) = &provider_config.api_key_env {
-                let missing = matches!(std::env::var(var), Ok(v) if v.is_empty())
-                    || std::env::var(var).is_err();
+                let missing = matches!(std::env::var(var), Ok(v) if v.is_empty()) || std::env::var(var).is_err();
                 if missing {
-                    tracing::warn!(
-                        "skipping provider '{}': ${var} is not set",
-                        provider_config.name
-                    );
+                    tracing::warn!("skipping provider '{}': ${var} is not set", provider_config.name);
                     continue;
                 }
             }
@@ -93,7 +89,9 @@ impl ModelRouter {
                             }
                             Ok(_) => {}
                             Err(err) => {
-                                tracing::warn!("failed to fetch capabilities for model '{model}' on provider '{name}': {err:#}");
+                                tracing::warn!(
+                                    "failed to fetch capabilities for model '{model}' on provider '{name}': {err:#}"
+                                );
                             }
                         }
                     }
@@ -164,11 +162,7 @@ impl ModelRouter {
         routes: &[RouteChoice],
     ) -> Option<(String, String)> {
         match rule {
-            RouterRule::Prefix {
-                model_prefix,
-                provider,
-                rewrite_model,
-            } => {
+            RouterRule::Prefix { model_prefix, provider, rewrite_model } => {
                 if model.starts_with(model_prefix.as_str()) {
                     let target = rewrite_model.clone().unwrap_or_else(|| model.to_string());
                     Some((provider.clone(), target))
@@ -176,11 +170,7 @@ impl ModelRouter {
                     None
                 }
             }
-            RouterRule::Tag {
-                tag,
-                provider,
-                rewrite_model,
-            } => {
+            RouterRule::Tag { tag, provider, rewrite_model } => {
                 if tags.iter().any(|t| t == tag) {
                     let target = rewrite_model.clone().unwrap_or_else(|| model.to_string());
                     Some((provider.clone(), target))
@@ -188,35 +178,16 @@ impl ModelRouter {
                     None
                 }
             }
-            RouterRule::Price {
-                providers,
-                max_cost_per_1m_tokens,
-            } => self.best_by(
-                providers,
-                *max_cost_per_1m_tokens,
-                model,
-                |pc| Some(pc.cost_per_1m_tokens),
-                Lower,
-            ),
-            RouterRule::Latency {
-                providers,
-                max_latency_ms,
-            } => self.best_by(providers, *max_latency_ms, model, |pc| pc.latency_ms, Lower),
-            RouterRule::Throughput {
-                providers,
-                min_tokens_per_sec,
-            } => self.best_by(
-                providers,
-                *min_tokens_per_sec,
-                model,
-                |pc| pc.throughput_tokens_per_sec,
-                Higher,
-            ),
-            RouterRule::Random {
-                providers,
-                rewrite_model,
-                candidates,
-            } => {
+            RouterRule::Price { providers, max_cost_per_1m_tokens } => {
+                self.best_by(providers, *max_cost_per_1m_tokens, model, |pc| Some(pc.cost_per_1m_tokens), Lower)
+            }
+            RouterRule::Latency { providers, max_latency_ms } => {
+                self.best_by(providers, *max_latency_ms, model, |pc| pc.latency_ms, Lower)
+            }
+            RouterRule::Throughput { providers, min_tokens_per_sec } => {
+                self.best_by(providers, *min_tokens_per_sec, model, |pc| pc.throughput_tokens_per_sec, Higher)
+            }
+            RouterRule::Random { providers, rewrite_model, candidates } => {
                 if !candidates.is_empty() {
                     candidates
                         .choose(&mut rand::thread_rng())
@@ -230,11 +201,7 @@ impl ModelRouter {
                 }
             }
             RouterRule::Discover { provider } => {
-                if self
-                    .available_models
-                    .get(provider)
-                    .is_some_and(|models| models.contains(model))
-                {
+                if self.available_models.get(provider).is_some_and(|models| models.contains(model)) {
                     Some((provider.clone(), model.to_string()))
                 } else {
                     None
@@ -245,8 +212,7 @@ impl ModelRouter {
                     .candidate_names(providers)
                     .filter_map(|name| {
                         let pc = self.provider_configs.get(&name)?;
-                        let score =
-                            quality_bias * pc.quality - (1.0 - quality_bias) * pc.cost_per_1m_tokens;
+                        let score = quality_bias * pc.quality - (1.0 - quality_bias) * pc.cost_per_1m_tokens;
                         Some((name, score))
                     })
                     .collect();
@@ -416,9 +382,7 @@ mod tests {
         assert_eq!(provider.name, "openai");
 
         // Simulate discovery having found "llama3:8b" on the ollama provider.
-        router
-            .available_models
-            .insert("ollama".to_string(), ["llama3:8b".to_string()].into_iter().collect());
+        router.available_models.insert("ollama".to_string(), ["llama3:8b".to_string()].into_iter().collect());
 
         let (provider, model) = router.resolve("llama3:8b", &[], &[], &[]).unwrap();
         assert_eq!(provider.name, "ollama");
@@ -462,9 +426,7 @@ mod tests {
     #[test]
     fn capability_filter_skips_incapable_candidate_falls_through() {
         let mut router = ModelRouter::from_config(&capability_test_config()).unwrap();
-        router
-            .model_capabilities
-            .insert("phi3:mini".to_string(), ["completion".to_string()].into_iter().collect());
+        router.model_capabilities.insert("phi3:mini".to_string(), ["completion".to_string()].into_iter().collect());
         router.model_capabilities.insert(
             "gemma3:latest".to_string(),
             ["completion".to_string(), "vision".to_string()].into_iter().collect(),
@@ -481,10 +443,9 @@ mod tests {
     #[test]
     fn capability_filter_routes_directly_when_model_is_capable() {
         let mut router = ModelRouter::from_config(&capability_test_config()).unwrap();
-        router.model_capabilities.insert(
-            "phi3:mini".to_string(),
-            ["completion".to_string(), "vision".to_string()].into_iter().collect(),
-        );
+        router
+            .model_capabilities
+            .insert("phi3:mini".to_string(), ["completion".to_string(), "vision".to_string()].into_iter().collect());
 
         let (provider, model) = router.resolve("phi3:mini", &[], &[], &["vision".to_string()]).unwrap();
         assert_eq!(provider.name, "ollama");
@@ -519,9 +480,7 @@ mod tests {
         )
         .unwrap();
         let mut router = ModelRouter::from_config(&config).unwrap();
-        router
-            .model_capabilities
-            .insert("phi3:mini".to_string(), ["completion".to_string()].into_iter().collect());
+        router.model_capabilities.insert("phi3:mini".to_string(), ["completion".to_string()].into_iter().collect());
 
         assert!(router.resolve("phi3:mini", &[], &[], &["vision".to_string()]).is_none());
     }
@@ -584,10 +543,7 @@ mod tests {
         assert_eq!(provider.name, "ollama");
 
         // Rules earlier in the chain still win over a confident pick.
-        let other = RouteChoice {
-            provider: "ollama".to_string(),
-            ..picked(0.9)
-        };
+        let other = RouteChoice { provider: "ollama".to_string(), ..picked(0.9) };
         let (provider, model) = router.resolve("local/x", &[], &[other], &[]).unwrap();
         assert_eq!(provider.name, "local");
         assert_eq!(model, "local/x");
@@ -644,10 +600,7 @@ mod tests {
 
         // With picks from both, the rule that comes first in the chain
         // decides, whatever order the picks are in.
-        let cev = RouteChoice {
-            model: "llama3.2-1b".to_string(),
-            ..picked_by("cev")
-        };
+        let cev = RouteChoice { model: "llama3.2-1b".to_string(), ..picked_by("cev") };
         let (_, model) = router.resolve("gpt-4", &[], &[picked_by("llm"), cev], &[]).unwrap();
         assert_eq!(model, "llama3.2-1b");
     }

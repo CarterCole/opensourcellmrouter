@@ -23,15 +23,15 @@ use std::time::Duration;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
-    Frame, Terminal,
 };
 use tokio_stream::StreamExt;
 
@@ -74,11 +74,7 @@ impl Stats {
     }
 
     fn avg_latency_ms(&self) -> u64 {
-        if self.total == 0 {
-            0
-        } else {
-            self.total_duration_ms / self.total as u64
-        }
+        if self.total == 0 { 0 } else { self.total_duration_ms / self.total as u64 }
     }
 }
 
@@ -214,12 +210,7 @@ pub async fn run(base_url: &str) -> anyhow::Result<()> {
 
 async fn read_sse(url: String, state: Arc<Mutex<AppState>>) {
     let client = reqwest::Client::new();
-    let resp = match client
-        .get(&url)
-        .header("Accept", "text/event-stream")
-        .send()
-        .await
-    {
+    let resp = match client.get(&url).header("Accept", "text/event-stream").send().await {
         Ok(r) => {
             state.lock().unwrap().sse_status = "live".to_string();
             r
@@ -258,7 +249,7 @@ async fn read_sse(url: String, state: Arc<Mutex<AppState>>) {
                         state.lock().unwrap().on_routed(id, provider, model);
                     }
                     Ok(RouterEvent::Complete { id, entry }) => {
-                        state.lock().unwrap().on_complete(id, entry);
+                        state.lock().unwrap().on_complete(id, *entry);
                     }
                     Err(_) => {}
                 }
@@ -281,10 +272,10 @@ async fn event_loop(
         tick.tick().await;
 
         while event::poll(Duration::ZERO)? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(key, state).await? {
-                    return Ok(());
-                }
+            if let Event::Key(key) = event::read()?
+                && handle_key(key, state).await?
+            {
+                return Ok(());
             }
         }
 
@@ -295,10 +286,7 @@ async fn event_loop(
 
 // ── input handling ────────────────────────────────────────────────────────────
 
-async fn handle_key(
-    key: event::KeyEvent,
-    state: &Arc<Mutex<AppState>>,
-) -> anyhow::Result<bool> {
+async fn handle_key(key: event::KeyEvent, state: &Arc<Mutex<AppState>>) -> anyhow::Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
@@ -369,12 +357,7 @@ async fn handle_key(
 /// `AppState.stream_buf` as chunks arrive, and on completion moves the full
 /// response into `chat_history`. All state transitions (including clearing
 /// `sending`) happen inside this function.
-async fn stream_chat(
-    state: Arc<Mutex<AppState>>,
-    base_url: &str,
-    model: &str,
-    history: &[serde_json::Value],
-) {
+async fn stream_chat(state: Arc<Mutex<AppState>>, base_url: &str, model: &str, history: &[serde_json::Value]) {
     let client = reqwest::Client::new();
 
     let result = client
@@ -407,11 +390,7 @@ async fn stream_chat(
             Err(e) => {
                 let mut st = state.lock().unwrap();
                 let partial = std::mem::take(&mut st.stream_buf);
-                let content = if partial.is_empty() {
-                    format!("error: {e}")
-                } else {
-                    partial
-                };
+                let content = if partial.is_empty() { format!("error: {e}") } else { partial };
                 st.chat_history.push(serde_json::json!({"role": "assistant", "content": content}));
                 st.sending = false;
                 return;
@@ -434,10 +413,10 @@ async fn stream_chat(
                 return;
             }
 
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(text) = v["choices"][0]["delta"]["content"].as_str() {
-                    state.lock().unwrap().stream_buf.push_str(text);
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
+                && let Some(text) = v["choices"][0]["delta"]["content"].as_str()
+            {
+                state.lock().unwrap().stream_buf.push_str(text);
             }
         }
     }
@@ -477,46 +456,19 @@ fn render_feed(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
     let border_style = focus_border(focused);
 
     let in_flight = s.pending.len();
-    let flight_suffix = if in_flight > 0 {
-        format!("  {} in flight", in_flight)
-    } else {
-        String::new()
-    };
-    let title = format!(
-        " Pipeline  {}  {} events{} ",
-        s.sse_status,
-        s.events.len(),
-        flight_suffix,
-    );
-    let hint = if focused {
-        " ↑/↓ scroll  Tab/i → chat  q quit "
-    } else {
-        " Tab/i to focus "
-    };
+    let flight_suffix = if in_flight > 0 { format!("  {} in flight", in_flight) } else { String::new() };
+    let title = format!(" Pipeline  {}  {} events{} ", s.sse_status, s.events.len(), flight_suffix,);
+    let hint = if focused { " ↑/↓ scroll  Tab/i → chat  q quit " } else { " Tab/i to focus " };
 
-    let block = Block::default()
-        .title(title)
-        .title_bottom(hint)
-        .borders(Borders::ALL)
-        .border_style(border_style);
+    let block = Block::default().title(title).title_bottom(hint).borders(Borders::ALL).border_style(border_style);
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     // Pending (in-flight) requests appear above completed ones, newest first.
-    let pending_items: Vec<ListItem> = s
-        .pending
-        .iter()
-        .rev()
-        .map(|e| pending_to_list_item(e))
-        .collect();
+    let pending_items: Vec<ListItem> = s.pending.iter().rev().map(|e| pending_to_list_item(e)).collect();
 
-    let done_items: Vec<ListItem> = s
-        .events
-        .iter()
-        .skip(s.scroll)
-        .map(entry_to_list_item)
-        .collect();
+    let done_items: Vec<ListItem> = s.events.iter().skip(s.scroll).map(entry_to_list_item).collect();
 
     let all_items: Vec<ListItem> = pending_items.into_iter().chain(done_items).collect();
 
@@ -548,10 +500,7 @@ fn pending_to_list_item(e: &PendingEntry) -> ListItem<'static> {
         spans.push(Span::styled(format!("[{tag}]"), Style::default().fg(Color::Magenta)));
     }
 
-    spans.push(Span::styled(
-        format!("  {}ms", elapsed_ms),
-        Style::default().fg(Color::DarkGray),
-    ));
+    spans.push(Span::styled(format!("  {}ms", elapsed_ms), Style::default().fg(Color::DarkGray)));
 
     ListItem::new(vec![Line::from(spans), Line::from("")])
 }
@@ -599,10 +548,7 @@ fn entry_to_list_item(e: &LogEntry) -> ListItem<'static> {
     }
 
     let dur_color = if e.error.is_some() { Color::Red } else { Color::DarkGray };
-    header.push(Span::styled(
-        format!("  {}ms", e.duration_ms),
-        Style::default().fg(dur_color),
-    ));
+    header.push(Span::styled(format!("  {}ms", e.duration_ms), Style::default().fg(dur_color)));
 
     let last_user = e
         .messages
@@ -620,10 +566,7 @@ fn entry_to_list_item(e: &LogEntry) -> ListItem<'static> {
     } else if let Some(resp) = &e.response {
         Line::from(vec![
             Span::styled("  reply: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                trunc(resp.content.replace('\n', " ").as_str(), 90),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(trunc(resp.content.replace('\n', " ").as_str(), 90), Style::default().fg(Color::White)),
         ])
     } else {
         Line::from("")
@@ -644,10 +587,7 @@ fn entry_to_list_item(e: &LogEntry) -> ListItem<'static> {
 fn render_stats(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
-            Span::styled(
-                s.stats.total.to_string(),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(s.stats.total.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled(" requests", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
@@ -658,20 +598,14 @@ fn render_stats(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
             Span::styled(" errors", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
-            Span::styled(
-                format!("{}ms", s.stats.avg_latency_ms()),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(format!("{}ms", s.stats.avg_latency_ms()), Style::default().fg(Color::White)),
             Span::styled(" avg", Style::default().fg(Color::DarkGray)),
         ]),
     ];
 
     if !s.pending.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(
-                s.pending.len().to_string(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(s.pending.len().to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(" in flight", Style::default().fg(Color::DarkGray)),
         ]));
     }
@@ -685,10 +619,8 @@ fn render_stats(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
         let mut providers: Vec<(&String, &u32)> = s.stats.by_provider.iter().collect();
         providers.sort_by(|a, b| b.1.cmp(a.1));
         for (name, count) in providers {
-            let pct = if s.stats.total > 0 { count * 100 / s.stats.total } else { 0 };
-            let ago = s.stats.last_ok.get(name)
-                .map(|&ts| ago_str(ts))
-                .unwrap_or_else(|| "never".to_string());
+            let pct = (count * 100).checked_div(s.stats.total).unwrap_or(0);
+            let ago = s.stats.last_ok.get(name).map(|&ts| ago_str(ts)).unwrap_or_else(|| "never".to_string());
             let ago_color = if ago == "never" { Color::Red } else { Color::DarkGray };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {name}"), Style::default().fg(Color::Cyan)),
@@ -716,10 +648,7 @@ fn render_stats(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
 
     f.render_widget(
         Paragraph::new(lines).block(
-            Block::default()
-                .title(" Stats ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+            Block::default().title(" Stats ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)),
         ),
         area,
     );
@@ -728,11 +657,7 @@ fn render_stats(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
 fn render_chat(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
     let focused = s.focus == Focus::Chat;
     let border_style = focus_border(focused);
-    let hint = if focused {
-        " Enter=send  Esc=back  :model <name>=change "
-    } else {
-        " Tab/i to focus "
-    };
+    let hint = if focused { " Enter=send  Esc=back  :model <name>=change " } else { " Tab/i to focus " };
 
     let block = Block::default()
         .title(format!(" Chat  model: {} ", s.model))
@@ -812,32 +737,24 @@ fn render_chat(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
     let scroll_offset = conv_lines.len().saturating_sub(pane_height) as u16;
 
     f.render_widget(
-        Paragraph::new(conv_lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_offset, 0))
-            .block(
-                Block::default()
-                    .title(route_title)
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
+        Paragraph::new(conv_lines).wrap(Wrap { trim: false }).scroll((scroll_offset, 0)).block(
+            Block::default()
+                .title(route_title)
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
         split[0],
     );
 
     let cursor = if focused && !s.sending { "█" } else { "" };
     f.render_widget(
-        Paragraph::new(format!("{}{}", s.input, cursor))
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .title(" ▸ ")
-                    .borders(Borders::ALL)
-                    .border_style(if focused {
-                        Style::default().fg(Color::Cyan)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    }),
-            ),
+        Paragraph::new(format!("{}{}", s.input, cursor)).style(Style::default().fg(Color::White)).block(
+            Block::default().title(" ▸ ").borders(Borders::ALL).border_style(if focused {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }),
+        ),
         split[1],
     );
 }
@@ -845,11 +762,7 @@ fn render_chat(f: &mut Frame, s: &AppState, area: ratatui::layout::Rect) {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn focus_border(focused: bool) -> Style {
-    if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    }
+    if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) }
 }
 
 fn trunc(s: &str, max: usize) -> String {
@@ -859,10 +772,8 @@ fn trunc(s: &str, max: usize) -> String {
 }
 
 fn ago_str(ts_ms: u64) -> String {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let now_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     let secs = now_ms.saturating_sub(ts_ms) / 1000;
     if secs < 60 {
         format!("{secs}s ago")

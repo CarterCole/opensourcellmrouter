@@ -16,8 +16,8 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::canonical::{
-    ChatRequest, ChatResponse, ContentPart, Message, PluginRequest, Role, StopReason, StreamEvent,
-    Tool, ToolCall, Usage,
+    ChatRequest, ChatResponse, ContentPart, Message, PluginRequest, Role, StopReason, StreamEvent, Tool, ToolCall,
+    Usage,
 };
 
 /// `content` may be a plain string or a list of content blocks. Anthropic
@@ -45,10 +45,21 @@ pub enum AnthropicContent {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
-    Image { source: ImageSource },
-    ToolUse { id: String, name: String, input: serde_json::Value },
-    ToolResult { tool_use_id: String, content: String },
+    Text {
+        text: String,
+    },
+    Image {
+        source: ImageSource,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
     /// Models that think adaptively return these by default, with an empty
     /// `thinking` when the display is omitted.
     #[serde(skip_serializing)]
@@ -289,10 +300,10 @@ impl From<&ChatRequest> for AnthropicMessagesRequest {
             Some(OutputConfig {
                 effort: req.effort.clone(),
                 task_budget: req.task_budget.clone(),
-                format: req.output_schema.clone().map(|schema| OutputFormat {
-                    format_type: "json_schema".to_string(),
-                    schema,
-                }),
+                format: req
+                    .output_schema
+                    .clone()
+                    .map(|schema| OutputFormat { format_type: "json_schema".to_string(), schema }),
             })
         } else {
             None
@@ -346,10 +357,7 @@ impl From<AnthropicMessagesResponse> for ChatResponse {
             content,
             stop_reason: stop_reason_from_anthropic(resp.stop_reason.as_deref()),
             tool_calls,
-            usage: Usage {
-                input_tokens: resp.usage.input_tokens,
-                output_tokens: resp.usage.output_tokens,
-            },
+            usage: Usage { input_tokens: resp.usage.input_tokens, output_tokens: resp.usage.output_tokens },
             tags: Vec::new(),
         }
     }
@@ -437,8 +445,12 @@ pub enum AnthropicStreamBlock {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicStreamDelta {
-    TextDelta { text: String },
-    InputJsonDelta { partial_json: String },
+    TextDelta {
+        text: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -493,10 +505,8 @@ impl AnthropicStreamDecoder {
 
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
-                self.usage = Usage {
-                    input_tokens: message.usage.input_tokens,
-                    output_tokens: message.usage.output_tokens,
-                };
+                self.usage =
+                    Usage { input_tokens: message.usage.input_tokens, output_tokens: message.usage.output_tokens };
             }
             AnthropicStreamEvent::ContentBlockStart { index, content_block } => match content_block {
                 AnthropicStreamBlock::Text { text } => {
@@ -528,10 +538,10 @@ impl AnthropicStreamDecoder {
                     // tool blocks stream `input_json_delta`s too, but aren't
                     // surfaced, so theirs would otherwise land on whichever
                     // tool call the client last saw open.
-                    if let Some(id) = self.tool_use_ids.get(&index) {
-                        if !partial_json.is_empty() {
-                            events.push(StreamEvent::ToolCallDelta { id: id.clone(), partial_input: partial_json });
-                        }
+                    if let Some(id) = self.tool_use_ids.get(&index)
+                        && !partial_json.is_empty()
+                    {
+                        events.push(StreamEvent::ToolCallDelta { id: id.clone(), partial_input: partial_json });
                     }
                 }
                 AnthropicStreamDelta::Other => {}
@@ -586,10 +596,7 @@ impl From<ChatResponse> for AnthropicMessagesResponse {
             model: resp.model,
             content,
             stop_reason: Some(stop_reason.to_string()),
-            usage: AnthropicUsage {
-                input_tokens: resp.usage.input_tokens,
-                output_tokens: resp.usage.output_tokens,
-            },
+            usage: AnthropicUsage { input_tokens: resp.usage.input_tokens, output_tokens: resp.usage.output_tokens },
         }
     }
 }
@@ -624,10 +631,8 @@ where
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
     tokio::spawn(async move {
-        let msg_id = format!(
-            "msg_{:x}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        );
+        let msg_id =
+            format!("msg_{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
 
         macro_rules! send {
             ($event_name:expr, $data:expr) => {
@@ -737,10 +742,7 @@ mod tests {
             Some(OutputConfig {
                 effort: effort.map(str::to_string),
                 task_budget,
-                format: output_schema.map(|schema| OutputFormat {
-                    format_type: "json_schema".to_string(),
-                    schema,
-                }),
+                format: output_schema.map(|schema| OutputFormat { format_type: "json_schema".to_string(), schema }),
             })
         } else {
             None
@@ -872,7 +874,8 @@ mod tests {
     fn outbound_request_serializes_effort_task_budget_and_format_under_output_config_key() {
         let budget = json!({"type": "tokens", "total": 64000});
         let schema = json!({"type": "object", "properties": {}, "additionalProperties": false});
-        let chat = chat_request(Some(json!({"type": "adaptive"})), Some("high"), Some(budget.clone()), Some(schema.clone()));
+        let chat =
+            chat_request(Some(json!({"type": "adaptive"})), Some("high"), Some(budget.clone()), Some(schema.clone()));
         let req = AnthropicMessagesRequest::from(&chat);
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(value["thinking"], json!({"type": "adaptive"}));
@@ -1241,7 +1244,10 @@ mod tests {
             events,
             vec![
                 StreamEvent::ToolCallStart { id: "toolu_1".to_string(), name: "get_weather".to_string() },
-                StreamEvent::ToolCallDelta { id: "toolu_1".to_string(), partial_input: r#"{"city":"Paris"}"#.to_string() },
+                StreamEvent::ToolCallDelta {
+                    id: "toolu_1".to_string(),
+                    partial_input: r#"{"city":"Paris"}"#.to_string()
+                },
             ]
         );
     }
@@ -1293,7 +1299,9 @@ mod tests {
         assert_eq!(decoder.decode_line("event: content_block_delta").unwrap(), Vec::new());
         assert_eq!(
             decoder
-                .decode_line(r#"data:{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#)
+                .decode_line(
+                    r#"data:{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#
+                )
                 .unwrap(),
             vec![StreamEvent::TextDelta { text: "hi".to_string() }]
         );
@@ -1337,7 +1345,10 @@ mod tests {
             vec![
                 StreamEvent::TextDelta { text: "hi".to_string() },
                 StreamEvent::TextDelta { text: " there".to_string() },
-                StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: Usage { input_tokens: 1, output_tokens: 2 } },
+                StreamEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage { input_tokens: 1, output_tokens: 2 },
+                },
             ],
             "claude-opus-4-8",
         )
@@ -1368,7 +1379,10 @@ mod tests {
         let events = render_to_events(
             vec![
                 StreamEvent::ToolCallStart { id: "toolu_1".to_string(), name: "get_weather".to_string() },
-                StreamEvent::ToolCallDelta { id: "toolu_1".to_string(), partial_input: r#"{"city":"nyc"}"#.to_string() },
+                StreamEvent::ToolCallDelta {
+                    id: "toolu_1".to_string(),
+                    partial_input: r#"{"city":"nyc"}"#.to_string(),
+                },
                 StreamEvent::Done { stop_reason: StopReason::ToolUse, usage: Usage::default() },
             ],
             "claude-opus-4-8",
@@ -1378,7 +1392,14 @@ mod tests {
         let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
-            vec!["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
         );
         assert_eq!(events[1].1["content_block"]["type"], "tool_use");
         assert_eq!(events[1].1["content_block"]["id"], "toolu_1");

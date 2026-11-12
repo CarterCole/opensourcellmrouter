@@ -228,11 +228,7 @@ impl ClassifierRegistry {
         ClassifierRegistry {
             entries: classifiers
                 .into_iter()
-                .map(|classifier| ClassifierEntry {
-                    classifier,
-                    enabled: true,
-                    settings: Map::new(),
-                })
+                .map(|classifier| ClassifierEntry { classifier, enabled: true, settings: Map::new() })
                 .collect(),
             cev: Some(cev),
             llm,
@@ -244,9 +240,7 @@ impl ClassifierRegistry {
     /// pick, both in registry order.
     pub async fn classify(&self, req: &ChatRequest) -> Classified {
         let classifications = join_all(self.entries.iter().filter(|entry| entry.enabled).map(|entry| async move {
-            let ctx = ClassifierContext {
-                settings: entry.settings.clone(),
-            };
+            let ctx = ClassifierContext { settings: entry.settings.clone() };
             (entry.classifier.id(), entry.classifier.classify(&ctx, req).await)
         }))
         .await;
@@ -308,7 +302,9 @@ fn check_routing(config: &Config, cev: Option<&cev::CevClassifier>, llm: Option<
 
     for (id, enabled, has_rule) in [("cev", cev.is_some(), cev_rule), ("llm", llm.is_some(), llm_rule)] {
         if !enabled && has_rule {
-            tracing::warn!("`routers` has a `type = \"{id}\"` rule, but classifier '{id}' isn't enabled, so it never matches");
+            tracing::warn!(
+                "`routers` has a `type = \"{id}\"` rule, but classifier '{id}' isn't enabled, so it never matches"
+            );
         }
     }
     if cev.is_some() && !cev_rule {
@@ -319,7 +315,9 @@ fn check_routing(config: &Config, cev: Option<&cev::CevClassifier>, llm: Option<
     }
     if llm.is_some() && !llm_rule {
         if teaching {
-            tracing::info!("classifier 'llm' routes nothing (no `type = \"llm\"` rule); its picks only label cev's decisions");
+            tracing::info!(
+                "classifier 'llm' routes nothing (no `type = \"llm\"` rule); its picks only label cev's decisions"
+            );
         } else {
             tracing::warn!("classifier 'llm' is enabled, but no `type = \"llm\"` rule in `routers` uses its picks");
         }
@@ -408,9 +406,7 @@ impl ResponseClassifierRegistry {
                 continue;
             }
 
-            let ctx = ClassifierContext {
-                settings: entry.settings.clone(),
-            };
+            let ctx = ClassifierContext { settings: entry.settings.clone() };
 
             match entry.classifier.classify(&ctx, req, resp).await {
                 Ok(new_tags) => {

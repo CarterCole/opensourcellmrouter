@@ -109,9 +109,7 @@ mod tests {
     #[tokio::test]
     async fn tags_default_refusal_phrase() {
         let classifier = RefusalClassifier;
-        let ctx = ClassifierContext {
-            settings: Default::default(),
-        };
+        let ctx = ClassifierContext { settings: Default::default() };
 
         let resp = response("I'm sorry, but I cannot help with that request.");
         let tags = classifier.classify(&ctx, &request(), &resp).await.unwrap();
@@ -121,9 +119,7 @@ mod tests {
     #[tokio::test]
     async fn no_match_returns_empty() {
         let classifier = RefusalClassifier;
-        let ctx = ClassifierContext {
-            settings: Default::default(),
-        };
+        let ctx = ClassifierContext { settings: Default::default() };
 
         let resp = response("Sure, here's a haiku about autumn.");
         let tags = classifier.classify(&ctx, &request(), &resp).await.unwrap();
@@ -133,9 +129,8 @@ mod tests {
     #[tokio::test]
     async fn uses_configured_phrases() {
         let classifier = RefusalClassifier;
-        let ctx = ClassifierContext {
-            settings: json!({"phrases": ["not going to do that"]}).as_object().unwrap().clone(),
-        };
+        let ctx =
+            ClassifierContext { settings: json!({"phrases": ["not going to do that"]}).as_object().unwrap().clone() };
 
         let resp = response("Not Going To Do That, sorry.");
         let tags = classifier.classify(&ctx, &request(), &resp).await.unwrap();

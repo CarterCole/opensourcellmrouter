@@ -177,9 +177,8 @@ fn ollama_messages_from_canonical(msg: &Message) -> Vec<OllamaMessage> {
             ContentPart::Audio { .. } => {
                 tracing::warn!("dropping audio from a request to an Ollama provider, which takes none");
             }
-            ContentPart::ToolUse { name, input, .. } => tool_calls.push(OllamaToolCall {
-                function: OllamaFunctionCall { name: name.clone(), arguments: input.clone() },
-            }),
+            ContentPart::ToolUse { name, input, .. } => tool_calls
+                .push(OllamaToolCall { function: OllamaFunctionCall { name: name.clone(), arguments: input.clone() } }),
             ContentPart::ToolResult { content, .. } => tool_results.push(content.clone()),
         }
     }
@@ -218,10 +217,7 @@ impl From<&ChatRequest> for OllamaChatRequest {
         }
 
         let options = if req.temperature.is_some() || req.max_tokens.is_some() {
-            Some(OllamaOptions {
-                temperature: req.temperature,
-                num_predict: req.max_tokens,
-            })
+            Some(OllamaOptions { temperature: req.temperature, num_predict: req.max_tokens })
         } else {
             None
         };
@@ -282,10 +278,7 @@ impl From<OllamaChatResponse> for ChatResponse {
             content: resp.message.content,
             stop_reason,
             tool_calls,
-            usage: Usage {
-                input_tokens: resp.prompt_eval_count,
-                output_tokens: resp.eval_count,
-            },
+            usage: Usage { input_tokens: resp.prompt_eval_count, output_tokens: resp.eval_count },
             tags: Vec::new(),
         }
     }
@@ -336,7 +329,8 @@ mod tests {
 
     #[test]
     fn request_forwards_output_schema_as_format() {
-        let schema = serde_json::json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]});
+        let schema =
+            serde_json::json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]});
         let mut req = base_request(vec![Message::text(Role::User, "hi")]);
         req.output_schema = Some(schema.clone());
 
@@ -387,10 +381,7 @@ mod tests {
     fn request_splits_tool_result_into_separate_tool_message() {
         let msg = Message {
             role: Role::User,
-            content: vec![ContentPart::ToolResult {
-                tool_use_id: "call_1".to_string(),
-                content: "sunny".to_string(),
-            }],
+            content: vec![ContentPart::ToolResult { tool_use_id: "call_1".to_string(), content: "sunny".to_string() }],
         };
         let req = base_request(vec![msg]);
 
@@ -444,10 +435,7 @@ mod tests {
     fn response_maps_usage_and_stop_reason() {
         let resp = OllamaChatResponse {
             model: "llama3".to_string(),
-            message: OllamaResponseMessage {
-                content: "hello".to_string(),
-                tool_calls: Vec::new(),
-            },
+            message: OllamaResponseMessage { content: "hello".to_string(), tool_calls: Vec::new() },
             done: true,
             done_reason: Some("stop".to_string()),
             prompt_eval_count: 10,
