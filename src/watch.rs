@@ -6,6 +6,9 @@
 //!
 //! `Start` events print a one-liner showing the model and in-flight count.
 //! `Complete` events print the full routing/response summary.
+//!
+//! If the server has an API key (`[server] api_key_env`), set
+//! `ROUTER_API_KEY` to it.
 
 use anyhow::Context;
 use tokio_stream::StreamExt;
@@ -23,11 +26,10 @@ const YELLOW: &str = "\x1b[33m";
 const MAGENTA: &str = "\x1b[35m";
 const RED: &str = "\x1b[31m";
 
-pub async fn run(base_url: &str) -> anyhow::Result<()> {
+pub async fn run(base_url: &str, client: reqwest::Client) -> anyhow::Result<()> {
     let url = format!("{}/dashboard/events", base_url.trim_end_matches('/'));
     eprintln!("connecting to {url} …");
 
-    let client = reqwest::Client::new();
     let resp = client
         .get(&url)
         .header("Accept", "text/event-stream")
@@ -35,6 +37,9 @@ pub async fn run(base_url: &str) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("connecting to {url}"))?;
 
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("server returned {}: set ROUTER_API_KEY to its API key", resp.status());
+    }
     if !resp.status().is_success() {
         anyhow::bail!("server returned {}", resp.status());
     }

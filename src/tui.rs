@@ -13,6 +13,9 @@
 //!   Enter           send the typed message
 //!   Esc             clear input / return to Feed
 //!   :model <name>   change the model used by the chat client
+//!
+//! If the server has an API key (`[server] api_key_env`), set
+//! `ROUTER_API_KEY` to it.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -104,6 +107,8 @@ struct AppState {
     sending: bool,
     sse_status: String,
     base_url: String,
+    /// Sends the server's API key, if it has one (see `main::viewer_client`).
+    client: reqwest::Client,
 }
 
 struct PendingEntry {
@@ -124,7 +129,7 @@ struct RoutedMeta {
 }
 
 impl AppState {
-    fn new(base_url: &str) -> Self {
+    fn new(base_url: &str, client: reqwest::Client) -> Self {
         AppState {
             events: VecDeque::new(),
             pending: Vec::new(),
@@ -139,6 +144,7 @@ impl AppState {
             sending: false,
             sse_status: "connecting…".to_string(),
             base_url: base_url.to_string(),
+            client,
         }
     }
 
@@ -180,14 +186,14 @@ impl AppState {
 
 // ── public entry point ────────────────────────────────────────────────────────
 
-pub async fn run(base_url: &str) -> anyhow::Result<()> {
-    let state = Arc::new(Mutex::new(AppState::new(base_url)));
+pub async fn run(base_url: &str, client: reqwest::Client) -> anyhow::Result<()> {
+    let state = Arc::new(Mutex::new(AppState::new(base_url, client.clone())));
 
     // Background task: read SSE and push events into shared state.
     {
         let state = state.clone();
         let url = format!("{}/dashboard/events", base_url.trim_end_matches('/'));
-        tokio::spawn(async move { read_sse(url, state).await });
+        tokio::spawn(async move { read_sse(url, client, state).await });
     }
 
     enable_raw_mode()?;
@@ -208,9 +214,13 @@ pub async fn run(base_url: &str) -> anyhow::Result<()> {
 
 // ── SSE reader ────────────────────────────────────────────────────────────────
 
-async fn read_sse(url: String, state: Arc<Mutex<AppState>>) {
-    let client = reqwest::Client::new();
+async fn read_sse(url: String, client: reqwest::Client, state: Arc<Mutex<AppState>>) {
     let resp = match client.get(&url).header("Accept", "text/event-stream").send().await {
+        Ok(r) if !r.status().is_success() => {
+            let hint = if r.status() == reqwest::StatusCode::UNAUTHORIZED { " (set ROUTER_API_KEY)" } else { "" };
+            state.lock().unwrap().sse_status = format!("error: server returned {}{hint}", r.status());
+            return;
+        }
         Ok(r) => {
             state.lock().unwrap().sse_status = "live".to_string();
             r
@@ -249,7 +259,7 @@ async fn read_sse(url: String, state: Arc<Mutex<AppState>>) {
                         state.lock().unwrap().on_routed(id, provider, model);
                     }
                     Ok(RouterEvent::Complete { id, entry }) => {
-                        state.lock().unwrap().on_complete(id, *entry);
+                        state.lock().unwrap().on_complete(id, entry);
                     }
                     Err(_) => {}
                 }
@@ -335,12 +345,13 @@ async fn handle_key(key: event::KeyEvent, state: &Arc<Mutex<AppState>>) -> anyho
                     let history = s.chat_history.clone();
                     let model = s.model.clone();
                     let url = s.base_url.clone();
+                    let client = s.client.clone();
                     s.sending = true;
                     drop(s);
 
                     let state2 = state.clone();
                     tokio::spawn(async move {
-                        stream_chat(state2, &url, &model, &history).await;
+                        stream_chat(state2, &client, &url, &model, &history).await;
                     });
                     return Ok(false);
                 }
@@ -357,9 +368,13 @@ async fn handle_key(key: event::KeyEvent, state: &Arc<Mutex<AppState>>) -> anyho
 /// `AppState.stream_buf` as chunks arrive, and on completion moves the full
 /// response into `chat_history`. All state transitions (including clearing
 /// `sending`) happen inside this function.
-async fn stream_chat(state: Arc<Mutex<AppState>>, base_url: &str, model: &str, history: &[serde_json::Value]) {
-    let client = reqwest::Client::new();
-
+async fn stream_chat(
+    state: Arc<Mutex<AppState>>,
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    history: &[serde_json::Value],
+) {
     let result = client
         .post(format!("{}/v1/chat/completions", base_url.trim_end_matches('/')))
         .json(&serde_json::json!({
@@ -368,7 +383,8 @@ async fn stream_chat(state: Arc<Mutex<AppState>>, base_url: &str, model: &str, h
             "stream": true,
         }))
         .send()
-        .await;
+        .await
+        .and_then(reqwest::Response::error_for_status);
 
     let resp = match result {
         Ok(r) => r,

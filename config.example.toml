@@ -17,8 +17,8 @@ host      = "127.0.0.1"
 port      = 8090
 dashboard = true
 # Set host = "0.0.0.0" to accept connections from other machines (e.g. for
-# launch-coding-agent.sh's remote host:port use), and set api_key_env
-# whenever you do — see docs/security.md.
+# launch-coding-agent.sh's remote host:port use). The router won't start
+# that way without api_key_env — see docs/security.md.
 # api_key_env = "ROUTER_API_KEY"
 
 [logging]
@@ -61,7 +61,7 @@ throughput_tokens_per_sec = 30
 [[providers]]
 name               = "cloudflare"
 format             = "openai"
-base_url           = "https://api.cloudflare.com/client/v4/accounts/e4847a910eddf0d11d40af276cc478b7/ai/v1"
+base_url           = "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1"
 api_key_env        = "CLOUDFLARE_API_TOKEN"
 cost_per_1m_tokens = 0.2
 quality            = 80

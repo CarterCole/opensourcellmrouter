@@ -23,6 +23,9 @@ use crate::canonical::{ChatResponse, Message, RouteChoice};
 /// year 292 million).
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// `Complete` dwarfs the others, but every event is serialized as soon as
+// it's built, so boxing it would buy nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum RouterEvent {
     /// Emitted immediately when a request enters `dispatch`, before
     /// classifiers or routing run. Lets the UI show in-flight requests.
@@ -40,12 +43,11 @@ pub enum RouterEvent {
     /// upstream call goes out.
     Routed { id: u64, ts_ms: u64, provider: String, model: String },
     /// Emitted when the pipeline finishes (response or error). `id` matches
-    /// the corresponding `Start` event. `entry` is boxed because a
-    /// `LogEntry` is several hundred bytes and the other variants are small.
+    /// the corresponding `Start` event.
     Complete {
         id: u64,
         #[serde(flatten)]
-        entry: Box<LogEntry>,
+        entry: LogEntry,
     },
 }
 
@@ -97,7 +99,13 @@ impl RequestLogger {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // The log holds every prompt and response, so a new one is readable
+        // by its owner only.
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(path)?;
         Ok(RequestLogger { file: Mutex::new(file) })
     }
 
@@ -125,6 +133,21 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn a_new_log_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("oslr-log-mode-{}", std::process::id()));
+        let path = dir.join("requests.jsonl");
+        let logger = RequestLogger::new(path.to_str().unwrap()).unwrap();
+        logger.log_line("{}");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(mode, 0o600);
+    }
+
     #[test]
     fn router_event_start_roundtrip() {
         let json = r#"{"type":"start","id":1,"ts_ms":1781573328452,"model":"llama3.1:8b","in_flight":2}"#;

@@ -91,9 +91,12 @@ standard OpenAI/Anthropic schema; stripped before forwarding upstream):
 ```
 
 A plugin enabled by config runs for every request; its settings are its
-config defaults merged with (and overridden by) any matching entry in that
-request's `plugins` array. A plugin *not* enabled by config can still be
-turned on for a single request by naming it in `plugins`.
+config defaults, overridden by any matching entry in that request's
+`plugins` array — but only in the settings the plugin lets a request set
+(its `request_settings()`, e.g. `pareto-router`'s `tier`). Other keys in the
+entry are ignored with a warning, so a client can't rewrite what the server
+configured. A plugin *not* enabled by config can still be turned on for a
+single request by naming it in `plugins`.
 
 ## Built-in plugins
 
@@ -123,7 +126,8 @@ high = ["anthropic"]
 ```
 
 A request can override the tier per-call: `{"plugins": [{"id":
-"pareto-router", "tier": "high"}]}`.
+"pareto-router", "tier": "high"}]}`. It can't set `tiers` or `default_tier`:
+otherwise any client could send any model to any configured provider.
 
 ### `web` (Web Search) — not yet implemented
 
@@ -146,3 +150,5 @@ replace each attachment with its extracted text.
 2. Register it in `PluginRegistry::from_config` (`src/plugins/mod.rs`).
 3. Document its `id()`, any `[plugins.<id>]` settings it reads via
    `ctx.settings`, and which hooks it implements.
+4. If a request should be able to set any of those settings, list them in
+   `request_settings()`; by default a request can set none.

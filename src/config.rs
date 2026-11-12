@@ -211,12 +211,59 @@ pub struct ServerConfig {
     /// `0.0.0.0` or otherwise reachable off-box).
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Lets the router start without `api_key_env` on a `host` other
+    /// machines can reach, which it otherwise refuses to — for when
+    /// something in front of it already controls who gets in (a reverse
+    /// proxy that authenticates, or a container whose port is only
+    /// published on the host's `127.0.0.1`). See [`Self::check_exposure`].
+    pub allow_unauthenticated: bool,
+    /// Host names an unauthenticated router answers to besides `localhost`,
+    /// `*.localhost` and IP addresses, e.g. `["router.lan"]`. Requests
+    /// addressed to any other name get `403`, which keeps web pages from
+    /// reaching it through DNS rebinding. Ignored with `api_key_env` set.
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        ServerConfig { host: "127.0.0.1".to_string(), port: 8090, dashboard: false, api_key_env: None }
+        ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 8090,
+            dashboard: false,
+            api_key_env: None,
+            allow_unauthenticated: false,
+            allowed_hosts: Vec::new(),
+        }
     }
+}
+
+impl ServerConfig {
+    /// Fails if the router would accept connections from other machines
+    /// without an API key (`has_key` false), unless `allow_unauthenticated`
+    /// says something else guards it: anyone who reached it could spend the
+    /// providers' keys and read every request on the dashboard.
+    pub fn check_exposure(&self, has_key: bool) -> anyhow::Result<()> {
+        if has_key || self.allow_unauthenticated || is_loopback(&self.host) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "[server] host = \"{}\" accepts connections from other machines, but api_key_env isn't set, so \
+             anyone who can reach it could use your providers and read every request. Set api_key_env (see \
+             docs/security.md), or host = \"127.0.0.1\" — or allow_unauthenticated = true if something in \
+             front of the router already controls who reaches it",
+            self.host
+        )
+    }
+}
+
+/// Whether binding `host` only accepts connections from this machine.
+fn is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The wire format a provider's API speaks.
@@ -258,5 +305,36 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading config file {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing config file {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(host: &str) -> ServerConfig {
+        ServerConfig { host: host.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn loopback_hosts_need_no_key() {
+        for host in ["127.0.0.1", "127.0.0.2", "::1", "[::1]", "localhost", "LOCALHOST"] {
+            assert!(server(host).check_exposure(false).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn other_hosts_need_a_key() {
+        for host in ["0.0.0.0", "::", "192.168.1.50", "router.lan"] {
+            let err = server(host).check_exposure(false).unwrap_err().to_string();
+            assert!(err.contains("api_key_env"), "{host}: {err}");
+            assert!(server(host).check_exposure(true).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn allow_unauthenticated_lets_other_hosts_start_without_a_key() {
+        let config = ServerConfig { allow_unauthenticated: true, ..server("0.0.0.0") };
+        assert!(config.check_exposure(false).is_ok());
     }
 }

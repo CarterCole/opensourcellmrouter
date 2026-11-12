@@ -20,6 +20,8 @@
 //! ```json
 //! {"plugins": [{"id": "pareto-router", "tier": "high"}]}
 //! ```
+//!
+//! but not `tiers` or `default_tier`, which only config sets.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -33,6 +35,11 @@ pub struct ParetoRouterPlugin;
 impl Plugin for ParetoRouterPlugin {
     fn id(&self) -> &'static str {
         "pareto-router"
+    }
+
+    /// A request picks its tier, but not which providers are in it.
+    fn request_settings(&self) -> &'static [&'static str] {
+        &["tier"]
     }
 
     async fn pre_request(

@@ -13,6 +13,7 @@ mod watch;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use anyhow::Context;
 use opentelemetry::trace::TracerProvider as _;
@@ -27,12 +28,12 @@ async fn main() -> anyhow::Result<()> {
         Some("watch") => {
             args.next();
             let url = args.next().unwrap_or_else(|| "http://localhost:8090".to_string());
-            return watch::run(&url).await;
+            return watch::run(&url, viewer_client()?).await;
         }
         Some("tui") => {
             args.next();
             let url = args.next().unwrap_or_else(|| "http://localhost:8090".to_string());
-            return tui::run(&url).await;
+            return tui::run(&url, viewer_client()?).await;
         }
         _ => args.next().unwrap_or_else(|| "config.toml".to_string()),
     };
@@ -43,7 +44,11 @@ async fn main() -> anyhow::Result<()> {
     let otel_state = init_telemetry(&config.telemetry)?;
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .read_timeout(UPSTREAM_READ_TIMEOUT)
+        .build()
+        .context("building the HTTP client")?;
 
     let mut model_router = router::ModelRouter::from_config(&config)?;
     model_router.discover_models(&client).await;
@@ -66,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
             std::env::var(var).with_context(|| format!("[server] api_key_env = \"{var}\" but that variable is not set"))
         })
         .transpose()?;
+    config.server.check_exposure(api_key.is_some())?;
 
     let plugin_registry = Arc::new(plugins::PluginRegistry::from_config(&config));
     let classifier_registry = Arc::new(classifiers::ClassifierRegistry::from_config(&config)?);
@@ -85,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             in_flight: Arc::new(AtomicU64::new(0)),
             next_id: Arc::new(AtomicU64::new(0)),
             api_key,
+            allowed_hosts: config.server.allowed_hosts.clone(),
         },
         config.server.dashboard,
     );
@@ -100,6 +107,31 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// How long to wait for a provider to accept a connection.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a provider may go without sending a byte — before its response
+/// starts, or between chunks of it — before the request fails. Generous,
+/// since a model can think for minutes before a non-streamed answer, but
+/// finite, so a provider that hangs doesn't hold a request open forever.
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Env var the `watch` and `tui` commands read the router's API key from
+/// (the value the server's `[server] api_key_env` names), if it has one.
+const VIEWER_KEY_ENV: &str = "ROUTER_API_KEY";
+
+/// The HTTP client `watch` and `tui` reach the router with: one that sends
+/// `$ROUTER_API_KEY` as a bearer token, if that's set.
+fn viewer_client() -> anyhow::Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(key) = std::env::var(VIEWER_KEY_ENV).ok().filter(|key| !key.is_empty()) {
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+            .with_context(|| format!("${VIEWER_KEY_ENV} isn't a valid header value"))?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    reqwest::Client::builder().default_headers(headers).build().context("building the HTTP client")
 }
 
 /// Handles to the OTel providers, kept alive for the lifetime of `main` so
