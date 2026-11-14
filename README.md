@@ -1,3 +1,5 @@
+![LLM ROUTER](.github/banner.png)
+
 # opensourcellmrouter
 
 A fast, local-first LLM router. Drop it in front of any OpenAI- or Anthropic-compatible client and route requests across a configurable pipeline of local and cloud providers — with classifiers, cost/latency/random routing rules, plugins, a live dashboard, and a built-in TUI.
